@@ -149,7 +149,13 @@ enum AgendaAPI {
     static func request(_ path: String, method: String = "GET", token: String? = nil,
                         query: [URLQueryItem] = [], body: Data? = nil) async throws -> Data {
         var components = URLComponents(string: baseURL + path)!
-        if !query.isEmpty { components.queryItems = query }
+        if !query.isEmpty {
+            components.queryItems = query
+            // PostgREST decodes '+' as a space. Preserve the exact server revision,
+            // including timezone and microseconds, for the optimistic-lock filter.
+            components.percentEncodedQuery = components.percentEncodedQuery?
+                .replacingOccurrences(of: "+", with: "%2B")
+        }
         var request = URLRequest(url: components.url!)
         request.httpMethod = method
         request.timeoutInterval = 25
@@ -197,6 +203,7 @@ enum AgendaAPI {
 
     static func timestamp(_ date: Date) -> String {
         let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.string(from: date)
     }
@@ -514,7 +521,7 @@ struct AgendaSyncView: View {
                         Text(error).font(.footnote).foregroundStyle(.orange)
                             .textSelection(.enabled)
                     }
-                    Text("Agenda a Blocchi 5.4.1 Sync · iPhone e iPad")
+                    Text("Agenda a Blocchi 5.4.2 Sync · iPhone e iPad")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if let account = store.signedInEmail {
