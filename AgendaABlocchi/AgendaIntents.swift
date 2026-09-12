@@ -1,5 +1,6 @@
 import Foundation
 import AppIntents
+import UIKit
 
 extension Notification.Name {
     static let agendaIntentDidModifyData = Notification.Name("it.agendaablocchi.intentDidModifyData")
@@ -1604,32 +1605,40 @@ extension AgendaIntentBridge {
 
 struct OpenEventMapsIntent: AppIntent {
     static var title: LocalizedStringResource = "Apri luogo impegno in Mappe"
+    static var openAppWhenRun: Bool = true
     static var description = IntentDescription("Apri luogo impegno in Mappe. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
     @Parameter(title: "Impegno") var event: AgendaEventEntity
 
 
     @MainActor
-    func perform() async throws -> some IntentResult & OpensIntent {
+    func perform() async throws -> some IntentResult {
         let store = AgendaIntentBridge.makeStore()
         let item = try store.requireEvent(event.id)
         let url = try AgendaIntentBridge.mapsURL(item)
 
-        return .result(opensIntent: OpenURLIntent(url))
+        guard await UIApplication.shared.open(url, options: [:]) else {
+            throw AgendaOperationError.invalid("Non riesco ad aprire Mappe per questo luogo.")
+        }
+        return .result()
     }
 }
 
 struct OpenNextEventMapsIntent: AppIntent {
     static var title: LocalizedStringResource = "Apri il luogo del prossimo impegno in Mappe"
+    static var openAppWhenRun: Bool = true
     static var description = IntentDescription("Apri il luogo del prossimo impegno in Mappe. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
 
 
     @MainActor
-    func perform() async throws -> some IntentResult & OpensIntent {
+    func perform() async throws -> some IntentResult {
         let store = AgendaIntentBridge.makeStore()
         guard let item = store.events.filter({ (AgendaIntentBridge.eventDate($0) ?? .distantPast) >= Date() }).sorted(by: AgendaIntentBridge.eventSort).first else { throw AgendaOperationError.invalid("Non hai impegni futuri.") }
         let url = try AgendaIntentBridge.mapsURL(item)
 
-        return .result(opensIntent: OpenURLIntent(url))
+        guard await UIApplication.shared.open(url, options: [:]) else {
+            throw AgendaOperationError.invalid("Non riesco ad aprire Mappe per questo luogo.")
+        }
+        return .result()
     }
 }
 
