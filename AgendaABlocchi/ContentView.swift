@@ -18,6 +18,7 @@ struct ContentView: View {
     @State private var sidebarCollapsed = false
     @State private var showFullDay = false
     @State private var quickTimeEvent: AgendaEvent?
+    @State private var showPhoneBlocks = false
 
     private let calendar = Calendar.current
     private let headerHeight: CGFloat = 48
@@ -25,10 +26,10 @@ struct ContentView: View {
     var body: some View {
         GeometryReader { geometry in
             let compact = geometry.size.width < 650
-            let expandedSidebarWidth: CGFloat = compact ? 108 : (geometry.size.width < 950 ? 170 : 220)
-            let sidebarWidth: CGFloat = sidebarCollapsed ? 50 : expandedSidebarWidth
-            let timeWidth: CGFloat = compact ? 43 : (geometry.size.width < 950 ? 52 : 64)
-            let calendarWidth = max(200, geometry.size.width - sidebarWidth - 1)
+            let expandedSidebarWidth: CGFloat = geometry.size.width < 950 ? 170 : 220
+            let sidebarWidth: CGFloat = compact ? 0 : (sidebarCollapsed ? 50 : expandedSidebarWidth)
+            let timeWidth: CGFloat = compact ? 38 : (geometry.size.width < 950 ? 52 : 64)
+            let calendarWidth = max(200, geometry.size.width - sidebarWidth - (compact ? 0 : 1))
             let dayCount = showWeekend ? 7 : 5
             let dayWidth = max(30, (calendarWidth - timeWidth) / CGFloat(dayCount))
             let usableHeight = max(570, geometry.size.height - (compact ? 106 : 64))
@@ -43,10 +44,12 @@ struct ContentView: View {
                 Divider()
 
                 HStack(alignment: .top, spacing: 0) {
-                    sidebar(compact: compact)
-                        .frame(width: sidebarWidth)
+                    if !compact {
+                        sidebar(compact: false)
+                            .frame(width: sidebarWidth)
 
-                    Divider()
+                        Divider()
+                    }
 
                     calendarView(
                         rowHeight: rowHeight,
@@ -68,6 +71,14 @@ struct ContentView: View {
                     .simultaneousGesture(weekSwipeGesture)
                 }
                 .animation(.easeInOut(duration: 0.28), value: weekStart)
+            }
+            .overlay(alignment: .bottom) {
+                if compact && showPhoneBlocks {
+                    phoneBlocksDrawer
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 8)
+                }
             }
             .background(Color(uiColor: .systemGroupedBackground))
         }
@@ -156,6 +167,17 @@ struct ContentView: View {
                 HStack {
                     Label("Agenda", systemImage: "calendar")
                         .font(.headline.bold())
+
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            showPhoneBlocks.toggle()
+                        }
+                    } label: {
+                        Label("Blocchi", systemImage: "square.grid.2x2")
+                            .font(.caption.bold())
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.indigo)
 
                     Spacer()
 
@@ -316,6 +338,121 @@ struct ContentView: View {
         }
 
         return "\(startMonth) – \(endMonth)"
+    }
+
+    private var phoneBlocksDrawer: some View {
+        VStack(spacing: 8) {
+            Capsule()
+                .fill(Color.secondary.opacity(0.35))
+                .frame(width: 38, height: 5)
+                .padding(.top, 6)
+
+            HStack {
+                Label("Blocchi", systemImage: "square.grid.2x2")
+                    .font(.headline.bold())
+                Spacer()
+                Button {
+                    showNewBlock = true
+                } label: {
+                    Label("Nuovo", systemImage: "plus")
+                        .font(.caption.bold())
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.22)) {
+                        showPhoneBlocks = false
+                    }
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Text("Trascina un blocco sul giorno e sull’orario desiderato.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 8) {
+                    ForEach(store.templates) { template in
+                        phoneTemplateCard(template)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+            .frame(height: 104)
+
+            if let selected = selectedTemplate {
+                HStack(spacing: 6) {
+                    Image(systemName: "hand.tap")
+                    Text("Inserimento rapido: \(selected.name)")
+                        .lineLimit(1)
+                    Spacer()
+                    Button {
+                        selectedTemplateID = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
+        )
+        .shadow(radius: 12, y: 4)
+    }
+
+    private func phoneTemplateCard(_ template: BlockTemplate) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color(hex: template.colorHex))
+                    .frame(width: 9, height: 28)
+
+                Text(template.name)
+                    .font(.caption.bold())
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Button {
+                    templateToEdit = template
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Text(durationText(template.durationSlots))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(8)
+        .frame(width: 132, height: 86, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(selectedTemplateID == template.id ? Color.indigo.opacity(0.14) : Color(uiColor: .secondarySystemGroupedBackground))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            selectedTemplateID = selectedTemplateID == template.id ? nil : template.id
+        }
+        .onDrag {
+            NSItemProvider(object: NSString(string: DragPayload.template(template.id).stringValue))
+        } preview: {
+            dragPreview(name: template.name, durationSlots: template.durationSlots, colorHex: template.colorHex)
+        }
     }
 
     @ViewBuilder
