@@ -52,10 +52,17 @@ struct AgendaRow: Codable {
 enum SyncFailure: Error, LocalizedError {
     case message(String)
     case http(Int)
+    case server(Int, String)
+    var statusCode: Int? {
+        switch self {
+        case .http(let status), .server(let status, _): return status
+        case .message: return nil
+        }
+    }
     var errorDescription: String? {
         switch self {
-        case .message(let text): return text
-        case .http(400): return "Richiesta non valida o credenziali errate. Verifica email e password."
+        case .message(let text), .server(_, let text): return text
+        case .http(400): return "Richiesta non valida (HTTP 400). Il server non ha fornito dettagli."
         case .http(401): return "Sessione scaduta. Accedi nuovamente; i dati locali sono conservati."
         case .http(403): return "Accesso negato. Verifica account e regole RLS su agenda_state."
         case .http(429): return "Troppe richieste. Riprova tra poco."
@@ -114,6 +121,31 @@ enum AgendaAPI {
     static let baseURL = "https://byuhxiyqvplxgwtrsgwz.supabase.co"
     static let publishableKey = "sb_publishable_ZVVDImhVukoLymc154OEIg_vPs_7Tqt"
 
+    // Read only error fields, never dump response bodies containing session tokens.
+    static func serverFailure(status: Int, data: Data, operation: String) -> SyncFailure {
+        let decoded = try? JSONSerialization.jsonObject(with: data)
+        let object: [String: Any] = (decoded as? [String: Any]) ?? [:]
+        func field(_ name: String) -> String? {
+            guard let text = object[name] as? String, !text.isEmpty else { return nil }
+            return String(text.prefix(1500))
+        }
+        let code = field("error_code") ?? field("code") ?? field("error")
+        let message = field("msg") ?? field("message") ?? field("error_description") ?? field("error")
+        var lines = ["\(operation) — HTTP \(status)" + (code.map { " · " + $0 } ?? "")]
+        lines.append(message ?? "Il server non ha restituito un messaggio JSON leggibile.")
+        if let details = field("details") { lines.append("Dettagli: " + details) }
+        if let hint = field("hint") { lines.append("Suggerimento: " + hint) }
+        switch code {
+        case "invalid_credentials": lines.append("Supabase non riconosce email o password per questo progetto.")
+        case "email_not_confirmed": lines.append("L’indirizzo email non risulta confermato in Supabase.")
+        case "email_provider_disabled": lines.append("L’accesso email è disabilitato nel progetto Supabase.")
+        case "refresh_token_not_found", "refresh_token_already_used": lines.append("Accedi nuovamente per rinnovare la sessione.")
+        default: break
+        }
+        lines.append("I dati locali sono conservati.")
+        return .server(status, lines.joined(separator: "\n"))
+    }
+
     static func request(_ path: String, method: String = "GET", token: String? = nil,
                         query: [URLQueryItem] = [], body: Data? = nil) async throws -> Data {
         var components = URLComponents(string: baseURL + path)!
@@ -125,6 +157,7 @@ enum AgendaAPI {
         request.setValue(publishableKey, forHTTPHeaderField: "apikey")
         if let token { request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
         if path.hasPrefix("/rest/") {
             request.setValue("public", forHTTPHeaderField: "Accept-Profile")
             request.setValue("public", forHTTPHeaderField: "Content-Profile")
@@ -133,7 +166,13 @@ enum AgendaAPI {
         request.httpBody = body
         let (data, response) = try await transport(request)
         guard let http = response as? HTTPURLResponse else { throw SyncFailure.http(503) }
-        guard (200..<300).contains(http.statusCode) else { throw SyncFailure.http(http.statusCode) }
+        guard (200..<300).contains(http.statusCode) else {
+            let operation = path == "/auth/v1/token"
+                ? (query.contains { $0.name == "grant_type" && $0.value == "password" }
+                    ? "Accesso Supabase" : "Rinnovo sessione Supabase")
+                : "Sincronizzazione agenda_state (\(method))"
+            throw serverFailure(status: http.statusCode, data: data, operation: operation)
+        }
         return data
     }
 
@@ -141,7 +180,15 @@ enum AgendaAPI {
         let data = try await request("/auth/v1/token", method: "POST",
             query: [URLQueryItem(name: "grant_type", value: grant)],
             body: JSONEncoder().encode(values))
-        var session = try JSONDecoder().decode(AgendaSession.self, from: data)
+        var session: AgendaSession
+        do {
+            session = try JSONDecoder().decode(AgendaSession.self, from: data)
+        } catch {
+            throw SyncFailure.message("Risposta Auth Supabase ricevuta, ma il formato della sessione non è valido (grant: \(grant)). I dati locali sono conservati.")
+        }
+        guard !session.access_token.isEmpty, !session.refresh_token.isEmpty else {
+            throw SyncFailure.message("Risposta Auth Supabase incompleta: token di sessione mancanti. I dati locali sono conservati.")
+        }
         if session.expires_at == nil {
             session.expires_at = Date().timeIntervalSince1970 + (session.expires_in ?? 3600)
         }
@@ -274,9 +321,9 @@ extension AgendaStore {
                 current = try await AgendaAPI.authenticate(grant: "refresh_token",
                     values: ["refresh_token": current.refresh_token])
             } catch {
-                if case SyncFailure.http(let code) = error, code == 400 || code == 401 || code == 403 {
+                if let code = (error as? SyncFailure)?.statusCode, code == 400 || code == 401 || code == 403 {
                     needsReauthentication = true
-                    throw SyncFailure.message("Sessione non più valida. Accedi di nuovo qui sotto; i dati locali sono conservati.")
+                    throw SyncFailure.message(error.localizedDescription + "\nAccedi di nuovo qui sotto per rinnovare la sessione.")
                 }
                 throw error
             }
@@ -375,7 +422,10 @@ extension AgendaStore {
                     result = try await AgendaAPI.request("/rest/v1/agenda_state",
                         method: remote == nil ? "POST" : "PATCH", token: current.access_token,
                         query: remote == nil ? [] : query, body: JSONEncoder().encode(row))
-                } catch SyncFailure.http(409) { continue }
+                } catch {
+                    if (error as? SyncFailure)?.statusCode == 409 { continue }
+                    throw error
+                }
                 let written = try JSONDecoder().decode([AgendaRow].self, from: result)
                 guard let accepted = written.first else { continue }
                 guard accepted.user_id == current.user.id, accepted.payload == sentPayload else {
@@ -395,7 +445,7 @@ extension AgendaStore {
         } catch is CancellationError {
             syncStatus = "Salvato sul dispositivo"
         } catch {
-            if case SyncFailure.http(401) = error {
+            if (error as? SyncFailure)?.statusCode == 401 {
                 session?.expires_at = 0 // Try refresh on the next foreground/poll.
             }
             syncError = (error as? URLError) != nil
@@ -462,8 +512,9 @@ struct AgendaSyncView: View {
                     if store.syncBusy { ProgressView() }
                     if let error = store.syncError {
                         Text(error).font(.footnote).foregroundStyle(.orange)
+                            .textSelection(.enabled)
                     }
-                    Text("Agenda a Blocchi 5.4 Sync · iPhone e iPad")
+                    Text("Agenda a Blocchi 5.4.1 Sync · iPhone e iPad")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if let account = store.signedInEmail {
