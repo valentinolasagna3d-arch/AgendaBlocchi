@@ -3,6 +3,8 @@ import UniformTypeIdentifiers
 import UIKit
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var showSync = false
     @Environment(\.openURL) private var openURL
     @StateObject private var store = AgendaStore()
 
@@ -82,6 +84,15 @@ struct ContentView: View {
             }
             .background(Color(uiColor: .systemGroupedBackground))
         }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            while !Task.isCancelled {
+                await store.synchronize()
+                do { try await Task.sleep(nanoseconds: 20_000_000_000) }
+                catch { return }
+            }
+        }
+        .sheet(isPresented: $showSync) { AgendaSyncView(store: store) }
         .sheet(isPresented: $showNewBlock) {
             BlockEditorView(
                 title: "Nuovo blocco",
@@ -160,13 +171,28 @@ struct ContentView: View {
         }
     }
 
+    private func syncTitle(_ title: String, font: Font) -> some View {
+        Button { showSync = true } label: {
+            Label {
+                Text(title)
+            } icon: {
+                Image(systemName: store.syncBusy ? "arrow.triangle.2.circlepath" :
+                    (store.syncError != nil || store.needsMigrationChoice ? "exclamationmark.icloud" :
+                        (store.signedInEmail == nil ? "icloud.slash" : "icloud")))
+                    .foregroundStyle(store.syncError == nil ? Color.secondary : Color.orange)
+            }
+            .font(font)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Sincronizzazione: " + store.syncStatus)
+    }
+
     @ViewBuilder
     private func topBar(compact: Bool) -> some View {
         if compact {
             VStack(spacing: 5) {
                 HStack {
-                    Label("Agenda", systemImage: "calendar")
-                        .font(.headline.bold())
+                    syncTitle("Agenda", font: .headline.bold())
 
                     Button {
                         withAnimation(.easeInOut(duration: 0.22)) {
@@ -229,8 +255,7 @@ struct ContentView: View {
         } else {
             ZStack {
                 HStack {
-                    Label("Agenda a blocchi", systemImage: "calendar")
-                        .font(.title3.bold())
+                    syncTitle("Agenda a blocchi", font: .title3.bold())
 
                     Spacer()
 

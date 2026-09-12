@@ -39,11 +39,35 @@ final class AgendaStore: ObservableObject {
         didSet { save() }
     }
 
+    @Published var syncStatus = "Solo su questo dispositivo"
+    @Published var syncError: String?
+    @Published var signedInEmail: String?
+    @Published var syncBusy = false
+    @Published var needsMigrationChoice = false
+    @Published var needsReauthentication = false
+    @Published var backups: [AgendaBackup] = []
+    var session: AgendaSession?
+    var localRevision = Date(timeIntervalSince1970: 0)
+    var ownerID: UUID?
+    var migrated = false
+    var hasLegacyData = false
+    var dirty = false
+    var applyingSnapshot = false
+    var syncAgain = false
+    var cacheHealthy = true
+    let defaults: UserDefaults
+    var loadSession: () throws -> AgendaSession? = { try AgendaKeychain.read() }
+    var saveSession: (AgendaSession) throws -> Void = { try AgendaKeychain.write($0) }
+    var deleteSession: () throws -> Void = { try AgendaKeychain.remove() }
+    let cacheKey = "agenda.sync.v54"
+
     private let templatesKey = "agenda.templates.v1"
     private let eventsKey = "agenda.events.v1"
 
-    init() {
-        let defaults = UserDefaults.standard
+    init(defaults: UserDefaults = .standard,
+         loadSession: @escaping () throws -> AgendaSession? = { try AgendaKeychain.read() }) {
+        self.defaults = defaults
+        self.loadSession = loadSession
         let decoder = JSONDecoder()
 
         if let data = defaults.data(forKey: templatesKey),
@@ -96,6 +120,7 @@ final class AgendaStore: ObservableObject {
         } else {
             events = []
         }
+        restoreSyncCache()
     }
 
     func addTemplate(
@@ -399,15 +424,26 @@ final class AgendaStore: ObservableObject {
         )
     }
 
+    func applySnapshot(_ payload: AgendaPayload) {
+        applyingSnapshot = true
+        for event in events { cancelNotification(id: event.id) }
+        templates = payload.templates
+        events = payload.events
+        applyingSnapshot = false
+        for event in events { scheduleNotification(for: event) }
+    }
+
     private func save() {
+        guard !applyingSnapshot else { return }
+        recordLocalChange()
         let encoder = JSONEncoder()
 
         if let data = try? encoder.encode(templates) {
-            UserDefaults.standard.set(data, forKey: templatesKey)
+            defaults.set(data, forKey: templatesKey)
         }
 
         if let data = try? encoder.encode(events) {
-            UserDefaults.standard.set(data, forKey: eventsKey)
+            defaults.set(data, forKey: eventsKey)
         }
     }
 }
