@@ -1,6 +1,8 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
+import Combine
+import AppIntents
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -93,6 +95,14 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showSync) { AgendaSyncView(store: store) }
+        .onReceive(NotificationCenter.default.publisher(for: .agendaIntentDidModifyData)) { _ in
+            // Siri/Comandi Rapidi may edit the same persistent agenda while this view is alive.
+            // Reload the sync cache so the calendar reflects the change immediately.
+            store.restoreSyncCache()
+        }
+        .onChange(of: store.templates) { _, _ in
+            AgendaAppShortcuts.updateAppShortcutParameters()
+        }
         .sheet(isPresented: $showNewBlock) {
             BlockEditorView(
                 title: "Nuovo blocco",
@@ -134,7 +144,11 @@ struct ContentView: View {
                         colorHex: color,
                         repeatWeeks: repeatWeeks,
                         reminderMinutes: reminderMinutes,
-                        location: location
+                        location: location,
+                        notes: template.notes,
+                        latitude: location == template.location ? template.latitude : nil,
+                        longitude: location == template.location ? template.longitude : nil,
+                        category: template.category, priority: template.priority
                     )
                     store.updateTemplate(updated)
 
@@ -1984,7 +1998,11 @@ struct EventEditorView: View {
                             repeatWeeks: repeatWeeks > 1 ? repeatWeeks : nil,
                             reminderMinutes: reminderMinutes >= 0 ? reminderMinutes : nil,
                             location: cleanLocation.isEmpty ? nil : cleanLocation,
-                            seriesID: event.seriesID
+                            seriesID: event.seriesID,
+                            notes: event.notes,
+                            latitude: cleanLocation == (event.location ?? "") ? event.latitude : nil,
+                            longitude: cleanLocation == (event.location ?? "") ? event.longitude : nil,
+                            category: event.category, priority: event.priority
                         )
 
                         if let error = onSave(updated) {

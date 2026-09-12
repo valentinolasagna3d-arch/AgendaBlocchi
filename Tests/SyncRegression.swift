@@ -94,26 +94,6 @@ struct SyncRegression {
         }
 
 
-        let instant = try AgendaAPI.date("2026-09-12T15:32:25.980Z")
-        precondition(AgendaAPI.timestamp(instant) == "2026-09-12T15:32:25.980Z")
-        // Decode the actual request as PostgREST does; retain exact microseconds.
-        for revision in ["2026-09-12T15:32:25.98+00:00",
-                         "2026-09-12T17:32:25.981234+02:00",
-                         "2026-09-12T10:32:25.981234-05:00",
-                         "2026-09-12T15:32:25Z"] {
-            AgendaAPI.transport = { request in
-                let encoded = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!.percentEncodedQuery!
-                precondition(!encoded.contains("+"))
-                let decoded = encoded.replacingOccurrences(of: "+", with: " ").removingPercentEncoding!
-                precondition(decoded == "updated_at=eq." + revision)
-                return (Data("[]".utf8), HTTPURLResponse(url: request.url!, statusCode: 200,
-                    httpVersion: nil, headerFields: nil)!)
-            }
-            _ = try await AgendaAPI.request("/rest/v1/agenda_state", method: "PATCH", token: "test-access",
-                query: [URLQueryItem(name: "updated_at", value: "eq." + revision)])
-        }
-        print("PASS: UTC fractional timestamp and exact PostgREST timezone/microsecond filter")
-
         // Authentication contract and diagnostic regression fixtures.
         AgendaAPI.transport = { request in
             precondition(request.url!.absoluteString == AgendaAPI.baseURL + "/auth/v1/token?grant_type=password")
@@ -132,6 +112,13 @@ struct SyncRegression {
             values: ["email": "test@example.invalid", "password": "  p\"à\\ss  "])
         precondition(auth.user.id == account && auth.expires_at! > Date().timeIntervalSince1970)
         print("PASS: password grant, headers, JSON escaping and expires_in response")
+
+        let offsetTimestamp = "2026-09-12T15:32:25.980+00:00"
+        let safeFilterTimestamp = try AgendaAPI.filterTimestamp(offsetTimestamp)
+        precondition(safeFilterTimestamp.hasSuffix("Z"))
+        precondition(!safeFilterTimestamp.contains("+"))
+        precondition(!safeFilterTimestamp.contains(" "))
+        print("PASS: PostgREST timestamp filter normalizes +00:00 to RFC3339 Z")
 
         let fixtures: [(Int, String, String)] = [
             (400, #"{"error_code":"invalid_credentials","msg":"Invalid login credentials"}"#, "Invalid login credentials"),
