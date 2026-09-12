@@ -28,7 +28,7 @@ struct ContentView: View {
             let compact = geometry.size.width < 650
             let expandedSidebarWidth: CGFloat = geometry.size.width < 950 ? 170 : 220
             let sidebarWidth: CGFloat = compact ? 0 : (sidebarCollapsed ? 50 : expandedSidebarWidth)
-            let timeWidth: CGFloat = compact ? 38 : (geometry.size.width < 950 ? 52 : 64)
+            let timeWidth: CGFloat = compact ? 46 : (geometry.size.width < 950 ? 52 : 64)
             let calendarWidth = max(200, geometry.size.width - sidebarWidth - (compact ? 0 : 1))
             let dayCount = showWeekend ? 7 : 5
             let dayWidth = max(30, (calendarWidth - timeWidth) / CGFloat(dayCount))
@@ -836,17 +836,20 @@ struct ContentView: View {
                 Text(slotTime(slot))
                     .font(
                         .system(
-                            size: slot % 4 == 0 ? 10.5 : 8.2,
+                            size: slot % 4 == 0 ? (timeWidth <= 46 ? 10.0 : 10.5) : (timeWidth <= 46 ? 7.8 : 8.2),
                             weight: slot % 4 == 0 ? .bold : .regular,
                             design: .rounded
                         )
                     )
                     .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                    .fixedSize(horizontal: true, vertical: false)
                     .foregroundStyle(slot % 4 == 0 ? Color.primary : Color.secondary)
-                    .padding(.horizontal, 4)
+                    .padding(.horizontal, 2)
                     .background(Color(uiColor: .secondarySystemGroupedBackground))
                     .offset(
-                        x: -4,
+                        x: -3,
                         y: topBottomInset + CGFloat(boundary) * rowHeight - 6
                     )
             }
@@ -980,25 +983,29 @@ struct ContentView: View {
         let height = CGFloat(event.durationSlots) * rowHeight
         let borderColor = Color.darker(hex: event.colorHex, amount: 0.32)
 
-        let compactEvent = dayWidth < 52
-        let horizontalPadding: CGFloat = compactEvent ? 2 : 7
+        // Su iPhone ogni giorno è stretto (~70 pt): usiamo una tipografia dedicata
+        // invece di lasciare che il testo venga troncato con "…".
+        let compactEvent = dayWidth < 90
+        let horizontalPadding: CGFloat = compactEvent ? 4 : 7
+        let eventWidth = max(20, dayWidth - (compactEvent ? 4 : 6))
 
-        return VStack(alignment: .leading, spacing: 1) {
+        return VStack(alignment: .leading, spacing: compactEvent ? 0 : 1) {
             if event.durationSlots > 1 && dayWidth >= 38 {
-                HStack(spacing: 4) {
+                HStack(spacing: 3) {
                     Text(event.name)
-                        .font(.system(size: compactEvent ? 9 : 13, weight: .bold, design: .rounded))
-                        .lineLimit(1)
+                        .font(.system(size: compactEvent ? 9.4 : 13, weight: .bold, design: .rounded))
+                        .lineLimit(compactEvent && height >= 44 ? 2 : 1)
+                        .minimumScaleFactor(0.72)
 
-                    Spacer(minLength: 2)
+                    Spacer(minLength: 1)
 
-                    if event.reminderMinutes != nil {
+                    if !compactEvent, event.reminderMinutes != nil {
                         Image(systemName: "bell.fill")
                             .font(.system(size: 8))
                             .foregroundStyle(.secondary)
                     }
 
-                    if let location = event.location, !location.isEmpty {
+                    if !compactEvent, let location = event.location, !location.isEmpty {
                         Image(systemName: "mappin.circle.fill")
                             .font(.system(size: 8))
                             .foregroundStyle(.secondary)
@@ -1006,15 +1013,35 @@ struct ContentView: View {
                 }
             }
 
-            if height >= 28 && dayWidth >= 46 {
-                Text("\(slotTime(event.startSlot))–\(slotTime(event.startSlot + event.durationSlots))")
-                    .font(.system(size: compactEvent ? 8 : 10.5, weight: .semibold, design: .rounded))
+            if compactEvent {
+                // Per i blocchi stretti evitiamo "11:00–…": l'intervallo va su due righe.
+                if height >= 38 {
+                    VStack(alignment: .leading, spacing: -1) {
+                        Text(slotTime(event.startSlot))
+                        Text("– " + slotTime(event.startSlot + event.durationSlots))
+                    }
+                    .font(.system(size: 7.4, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                } else if height >= 27 {
+                    Text(slotTime(event.startSlot))
+                        .font(.system(size: 7.2, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            } else if height >= 28 && dayWidth >= 46 {
+                Text("\(slotTime(event.startSlot))–\(slotTime(event.startSlot + event.durationSlots))")
+                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
             }
 
-            if height >= 46 && dayWidth >= 64, let location = event.location, !location.isEmpty {
+            if height >= 50 && dayWidth >= 86, let location = event.location, !location.isEmpty {
                 HStack(spacing: 3) {
                     Image(systemName: "mappin.and.ellipse")
                         .font(.system(size: 8.5, weight: .semibold))
@@ -1025,9 +1052,10 @@ struct ContentView: View {
                         openLocationInGoogleMaps(location)
                     } label: {
                         Text(location)
-                            .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                            .font(.system(size: 9.0, weight: .semibold, design: .rounded))
                             .underline()
                             .lineLimit(1)
+                            .minimumScaleFactor(0.72)
                             .foregroundStyle(Color.blue)
                     }
                     .buttonStyle(.plain)
@@ -1038,7 +1066,7 @@ struct ContentView: View {
         .padding(.horizontal, horizontalPadding)
         .padding(.vertical, compactEvent ? 2 : 4)
         .frame(
-            width: dayWidth - 6,
+            width: eventWidth,
             height: max(12, height - 1),
             alignment: .topLeading
         )
