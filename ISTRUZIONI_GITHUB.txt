@@ -1,0 +1,18 @@
+AGENDA A BLOCCHI v5.1 - BUILD IPA GRATIS CON GITHUB ACTIONS
+
+Questo progetto contiene già il workflow .github/workflows/build-ipa.yml.
+Il workflow usa un Mac di GitHub per compilare l'app SENZA firma.
+L'IPA risultante viene poi firmato/installato da SideStore sul tuo iPad/iPhone.
+
+1) Crea un repository GitHub.
+2) Carica TUTTO il contenuto di questa cartella, compresa la cartella nascosta .github.
+3) Apri la scheda Actions del repository.
+4) Seleziona "Build Agenda IPA".
+5) Premi "Run workflow" e poi di nuovo "Run workflow".
+6) Attendi che il job diventi verde.
+7) Apri il job completato e scarica l'artifact "AgendaABlocchi-v5.1-IPA".
+8) Estrai lo ZIP dell'artifact: dentro trovi AgendaABlocchi_v5_1_unsigned.ipa.
+9) Porta l'IPA sull'iPad (iCloud Drive, Google Drive, e-mail, ecc.).
+10) In SideStore: My Apps > + > seleziona l'IPA e installa.
+
+Nota: l'IPA è intenzionalmente non firmato. SideStore lo firma con il tuo Apple Account durante l'installazione.
