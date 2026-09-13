@@ -144,11 +144,7 @@ struct ContentView: View {
                         colorHex: color,
                         repeatWeeks: repeatWeeks,
                         reminderMinutes: reminderMinutes,
-                        location: location,
-                        notes: template.notes,
-                        latitude: location == template.location ? template.latitude : nil,
-                        longitude: location == template.location ? template.longitude : nil,
-                        category: template.category, priority: template.priority
+                        location: location
                     )
                     store.updateTemplate(updated)
 
@@ -1998,11 +1994,7 @@ struct EventEditorView: View {
                             repeatWeeks: repeatWeeks > 1 ? repeatWeeks : nil,
                             reminderMinutes: reminderMinutes >= 0 ? reminderMinutes : nil,
                             location: cleanLocation.isEmpty ? nil : cleanLocation,
-                            seriesID: event.seriesID,
-                            notes: event.notes,
-                            latitude: cleanLocation == (event.location ?? "") ? event.latitude : nil,
-                            longitude: cleanLocation == (event.location ?? "") ? event.longitude : nil,
-                            category: event.category, priority: event.priority
+                            seriesID: event.seriesID
                         )
 
                         if let error = onSave(updated) {

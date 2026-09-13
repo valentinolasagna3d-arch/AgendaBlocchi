@@ -1,6 +1,5 @@
 import Foundation
 import AppIntents
-import UIKit
 
 extension Notification.Name {
     static let agendaIntentDidModifyData = Notification.Name("it.agendaablocchi.intentDidModifyData")
@@ -50,6 +49,19 @@ enum AgendaColorChoice: String, AppEnum {
         case .turchese: return "#AEE5E2"
         }
     }
+}
+
+enum AgendaShiftDirection: String, AppEnum {
+    case avanti
+    case indietro
+
+    static var typeDisplayRepresentation: TypeDisplayRepresentation = "Direzione"
+    static var caseDisplayRepresentations: [AgendaShiftDirection: DisplayRepresentation] = [
+        .avanti: "Avanti",
+        .indietro: "Indietro"
+    ]
+
+    var sign: Int { self == .avanti ? 1 : -1 }
 }
 
 struct AgendaBlockEntity: AppEntity {
@@ -156,6 +168,10 @@ enum AgendaIntentBridge {
         IntentDialog(LocalizedStringResource(stringLiteral: text))
     }
 
+    static func spokenResult(_ text: String) -> some IntentResult & ProvidesDialog & ReturnsValue<String> {
+        .result(value: text, dialog: dialog(text))
+    }
+
     static func notifyMutation() {
         NotificationCenter.default.post(name: .agendaIntentDidModifyData, object: nil)
     }
@@ -184,20 +200,33 @@ enum AgendaIntentBridge {
         return formatter.string(from: date)
     }
 
-    static func slot(for date: Date) throws -> Int { try AgendaTime.slot(date) }
+    static func slot(for date: Date) throws -> Int {
+        let parts = Calendar.current.dateComponents([.hour, .minute], from: date)
+        guard let hour = parts.hour, let minute = parts.minute else {
+            throw AgendaIntentFailure.message("Non riesco a leggere l'orario.")
+        }
+        let minutesFromMidnight = hour * 60 + minute
+        let relative = Double(minutesFromMidnight - 8 * 60) / 15.0
+        let slot = Int(relative.rounded())
+        guard (-32..<64).contains(slot) else {
+            throw AgendaIntentFailure.message("L'orario deve essere compreso tra mezzanotte e le 23:45.")
+        }
+        return slot
+    }
 
-    static func slots(minutes: Int) throws -> Int { try AgendaTime.slots(minutes) }
+    static func slots(minutes: Int) throws -> Int {
+        guard minutes > 0 else {
+            throw AgendaIntentFailure.message("La durata deve essere maggiore di zero.")
+        }
+        return max(1, Int(ceil(Double(minutes) / 15.0)))
+    }
 
     static func slots(from start: Date, to end: Date) throws -> Int {
-        let first = try AgendaTime.slot(start)
-        let key = AgendaTime.key(start)
-        let last: Int
-        if end == (try AgendaTime.date(key: key, slot: 64)) { last = 64 }
-        else {
-            guard AgendaTime.key(end) == key else { throw AgendaOperationError.invalid("La fine deve essere nello stesso giorno o a mezzanotte.") }
-            last = try AgendaTime.slot(end)
+        let seconds = end.timeIntervalSince(start)
+        guard seconds > 0 else {
+            throw AgendaIntentFailure.message("L'orario di fine deve essere successivo all'inizio.")
         }
-        return try AgendaTime.slots((last - first) * 15)
+        return try slots(minutes: Int(ceil(seconds / 60.0)))
     }
 
     static func eventDate(_ event: AgendaEvent) -> Date? {
@@ -295,22 +324,22 @@ enum AgendaIntentBridge {
             reminderMinutes: nil,
             location: nil
         )
-        try AgendaTime.metadata(reminder: reminderMinutes, latitude: nil, longitude: nil, priority: nil)
-        if let repeatWeeks, !(1...104).contains(repeatWeeks) { throw AgendaOperationError.invalid("Indica da 1 a 104 settimane.") }
         template.name = trimmed
         template.durationSlots = durationSlots
         if let repeatWeeks { template.repeatWeeks = max(1, repeatWeeks) }
         if let reminderMinutes { template.reminderMinutes = max(0, reminderMinutes) }
         if let location, !location.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             template.location = location
-            template.latitude = nil
-            template.longitude = nil
         }
 
-        let item = AgendaEvent(id: UUID(), templateID: template.id, name: template.name, durationSlots: durationSlots, colorHex: template.colorHex, dateKey: dateKey(start), startSlot: startSlot, reminderMinutes: template.reminderMinutes, location: template.location, notes: template.notes, latitude: template.latitude, longitude: template.longitude, category: template.category, priority: template.priority)
-        let created = try store.copies(of: item, firstStart: start, count: template.repeatWeeks ?? 1, intervalDays: 7)
-        try store.insertEvents(created)
-        return created[0]
+        let oldIDs = Set(store.events.map(\.id))
+        if let error = store.addEvent(template: template, dateKey: dateKey(start), startSlot: startSlot) {
+            throw AgendaIntentFailure.message(error)
+        }
+        guard let created = store.events.first(where: { !oldIDs.contains($0.id) }) else {
+            throw AgendaIntentFailure.message("Non sono riuscito a creare l'impegno.")
+        }
+        return created
     }
 
     static func dayEvents(_ store: AgendaStore, date: Date) -> [AgendaEvent] {
@@ -360,11 +389,252 @@ enum AgendaIntentBridge {
         if rangeEnd - cursor >= minimumSlots { free.append((cursor, rangeEnd)) }
         return free
     }
+
+    static func event(named name: String, in store: AgendaStore) -> AgendaEvent? {
+        let needle = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let now = Date()
+        let matching = store.events.filter { event in
+            event.name.compare(needle, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame ||
+            event.name.localizedCaseInsensitiveContains(needle) ||
+            needle.localizedCaseInsensitiveContains(event.name)
+        }
+        return matching
+            .sorted { lhs, rhs in
+                let ld = eventDate(lhs) ?? .distantFuture
+                let rd = eventDate(rhs) ?? .distantFuture
+                let lFuture = ld >= now
+                let rFuture = rd >= now
+                if lFuture != rFuture { return lFuture }
+                return abs(ld.timeIntervalSince(now)) < abs(rd.timeIntervalSince(now))
+            }
+            .first
+    }
+
+    static func eventRangeText(_ event: AgendaEvent) -> String {
+        "\(event.name) dalle \(timeText(slot: event.startSlot)) alle \(timeText(slot: event.startSlot + event.durationSlots))"
+    }
+
+    static func dateByShifting(_ event: AgendaEvent, minutes: Int) throws -> Date {
+        guard let date = eventDate(event),
+              let shifted = Calendar.current.date(byAdding: .minute, value: minutes, to: date) else {
+            throw AgendaIntentFailure.message("Non riesco a calcolare il nuovo orario.")
+        }
+        return shifted
+    }
+
+    static func nextFreeStart(
+        store: AgendaStore,
+        date: Date,
+        durationSlots: Int,
+        fromHour: Int,
+        toHour: Int,
+        excluding eventID: UUID? = nil
+    ) throws -> Int? {
+        guard (0...23).contains(fromHour), (1...24).contains(toHour), toHour > fromHour else {
+            throw AgendaIntentFailure.message("L’intervallo orario non è valido.")
+        }
+        let rangeStart = Int((Double(fromHour * 60 - 8 * 60) / 15.0).rounded())
+        let rangeEnd = Int((Double(toHour * 60 - 8 * 60) / 15.0).rounded())
+        let dateKey = dateKey(date)
+        let busy = store.events(on: dateKey)
+            .filter { $0.id != eventID }
+            .sorted { $0.startSlot < $1.startSlot }
+
+        var cursor = rangeStart
+        for item in busy {
+            if cursor + durationSlots <= item.startSlot { return cursor }
+            cursor = max(cursor, item.startSlot + item.durationSlots)
+        }
+        return cursor + durationSlots <= rangeEnd ? cursor : nil
+    }
+
+    static func dateFor(dateKey: String, slot: Int) -> Date? {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = Calendar.current.timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        guard let day = formatter.date(from: dateKey) else { return nil }
+        let minutes = 8 * 60 + slot * 15
+        return Calendar.current.date(bySettingHour: minutes / 60, minute: minutes % 60, second: 0, of: day)
+    }
+
+    static func normalized(_ text: String) -> String {
+        text.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "it_IT"))
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func minutesMentioned(in text: String) -> Int? {
+        let value = normalized(text)
+        if value.contains("un quarto d'ora") || value.contains("un quarto d’ora") { return 15 }
+        if value.contains("un'ora e mezza") || value.contains("un’ora e mezza") || value.contains("una ora e mezza") { return 90 }
+        if value.contains("due ore") || value.contains("2 ore") { return 120 }
+        if value.contains("tre ore") || value.contains("3 ore") { return 180 }
+        if value.contains("quattro ore") || value.contains("4 ore") { return 240 }
+        if value.contains("mezz'ora") || value.contains("mezz’ora") || value.contains("mezza ora") { return 30 }
+        if value.contains("un'ora") || value.contains("un’ora") || value.contains("una ora") || value.contains("1 ora") { return 60 }
+        let pattern = #"(\d{1,3})\s*(minuti|minuto|min)"#
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
+           let range = Range(match.range(at: 1), in: value) {
+            return Int(value[range])
+        }
+        return nil
+    }
+
+    static func hourMentioned(in text: String, baseDate: Date) -> Date? {
+        let normalized = normalized(text)
+        let pattern = #"(?:alle|ore)\s*(\d{1,2})(?:[:\.]([0-5]\d))?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: normalized, range: NSRange(normalized.startIndex..., in: normalized)),
+              let hourRange = Range(match.range(at: 1), in: normalized),
+              let hour = Int(normalized[hourRange]), (0...23).contains(hour) else { return nil }
+        var minute = 0
+        if match.range(at: 2).location != NSNotFound,
+           let minuteRange = Range(match.range(at: 2), in: normalized) {
+            minute = Int(normalized[minuteRange]) ?? 0
+        }
+        return Calendar.current.date(bySettingHour: hour, minute: minute, second: 0, of: baseDate)
+    }
+
+    static func dayMentioned(in text: String) -> Date {
+        let value = normalized(text)
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        if value.contains("dopodomani") { return calendar.date(byAdding: .day, value: 2, to: today) ?? today }
+        if value.contains("domani") { return calendar.date(byAdding: .day, value: 1, to: today) ?? today }
+        if value.contains("oggi") { return today }
+
+        let names: [(String, Int)] = [
+            ("domenica", 1), ("lunedi", 2), ("martedi", 3), ("mercoledi", 4),
+            ("giovedi", 5), ("venerdi", 6), ("sabato", 7)
+        ]
+        if let targetWeekday = names.first(where: { value.contains($0.0) })?.1 {
+            let currentWeekday = calendar.component(.weekday, from: today)
+            var delta = (targetWeekday - currentWeekday + 7) % 7
+            if delta == 0 && value.contains("prossim") { delta = 7 }
+            return calendar.date(byAdding: .day, value: delta, to: today) ?? today
+        }
+        return today
+    }
+
+    static func colorMentioned(in text: String) -> AgendaColorChoice? {
+        let value = normalized(text)
+        let aliases: [(AgendaColorChoice, [String])] = [
+            (.azzurro, ["azzurro", "blu", "celeste"]),
+            (.rosa, ["rosa", "fucsia"]),
+            (.verde, ["verde"]),
+            (.giallo, ["giallo"]),
+            (.lilla, ["lilla", "viola"]),
+            (.arancio, ["arancio", "arancione"]),
+            (.grigio, ["grigio"]),
+            (.turchese, ["turchese"])
+        ]
+        return aliases.first { item in item.1.contains(where: { value.contains($0) }) }?.0
+    }
+
+    static func reminderMentioned(in text: String) -> Int? {
+        let value = normalized(text)
+        let anchors = ["promemoria", "ricord", "avvis"]
+        guard let anchor = anchors.compactMap({ value.range(of: $0) }).min(by: { $0.lowerBound < $1.lowerBound }) else { return nil }
+        let tail = String(value[anchor.lowerBound...])
+        return minutesMentioned(in: tail) ?? 15
+    }
+
+    static func locationMentioned(in text: String) -> String? {
+        let original = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = normalized(original)
+        let anchors = [" luogo ", " presso ", " posto "]
+        for anchor in anchors {
+            guard let range = value.range(of: anchor) else { continue }
+            let offset = value.distance(from: value.startIndex, to: range.upperBound)
+            let idx = original.index(original.startIndex, offsetBy: min(offset, original.count))
+            var tail = String(original[idx...]).trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+            for stop in [" con promemoria", " promemoria", " per ", " e promemoria"] {
+                if let cut = tail.lowercased().range(of: stop) { tail = String(tail[..<cut.lowerBound]) }
+            }
+            if !tail.isEmpty { return tail }
+        }
+        return nil
+    }
+
+    static func repeatWeeksMentioned(in text: String) -> Int? {
+        let value = normalized(text)
+        guard value.contains("settim") || value.contains("ripet") else { return nil }
+        let pattern = #"(\d{1,2})\s*settim"#
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
+           let range = Range(match.range(at: 1), in: value) {
+            return max(1, Int(value[range]) ?? 1)
+        }
+        if value.contains("ogni settimana") || value.contains("settimanale") { return 2 }
+        return nil
+    }
+
+    static func duplicateEvent(_ event: AgendaEvent, in store: AgendaStore, dateKey: String, startSlot: Int) throws -> AgendaEvent {
+        let template = BlockTemplate(
+            id: event.templateID,
+            name: event.name,
+            durationSlots: event.durationSlots,
+            colorHex: event.colorHex,
+            repeatWeeks: nil,
+            reminderMinutes: event.reminderMinutes,
+            location: event.location
+        )
+        let oldIDs = Set(store.events.map(\.id))
+        if let error = store.addEvent(template: template, dateKey: dateKey, startSlot: startSlot) {
+            throw AgendaIntentFailure.message(error)
+        }
+        guard let created = store.events.first(where: { !oldIDs.contains($0.id) }) else {
+            throw AgendaIntentFailure.message("Non sono riuscito a duplicare l'impegno.")
+        }
+        return created
+    }
+
+    static func templateMentioned(in text: String, store: AgendaStore) -> BlockTemplate? {
+        let normalizedText = normalized(text)
+        return store.templates
+            .sorted { $0.name.count > $1.name.count }
+            .first { normalizedText.contains(normalized($0.name)) }
+    }
+
+    static func eventMentioned(in text: String, store: AgendaStore) -> AgendaEvent? {
+        let normalizedText = normalized(text)
+        let candidates = store.events.filter { normalizedText.contains(normalized($0.name)) }
+        let now = Date()
+        return candidates.sorted { lhs, rhs in
+            let ld = eventDate(lhs) ?? .distantFuture
+            let rd = eventDate(rhs) ?? .distantFuture
+            let lf = ld >= now
+            let rf = rd >= now
+            if lf != rf { return lf }
+            return abs(ld.timeIntervalSince(now)) < abs(rd.timeIntervalSince(now))
+        }.first
+    }
+
+    static func guessedNewBlockName(in text: String) -> String? {
+        let normalizedText = normalized(text)
+        let anchors = ["chiamato ", "chiamata ", "blocco preimpostato ", "blocco riutilizzabile ", "nuovo blocco ", "crea un blocco ", "crea blocco "]
+        for anchor in anchors {
+            guard let range = normalizedText.range(of: anchor) else { continue }
+            var tail = String(normalizedText[range.upperBound...])
+            let stops = [" da ", " di ", " durata ", " con ", " per ", " colore ", " promemoria ", " luogo "]
+            if let cut = stops.compactMap({ tail.range(of: $0)?.lowerBound }).min() {
+                tail = String(tail[..<cut])
+            }
+            let cleaned = tail.trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters))
+            if !cleaned.isEmpty {
+                return cleaned.prefix(1).uppercased() + cleaned.dropFirst()
+            }
+        }
+        return nil
+    }
 }
 
 struct AddReusableBlockToAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Aggiungi blocco all'agenda"
-    static var description = IntentDescription("Inserisce uno dei blocchi riutilizzabili in un giorno e orario dell'agenda.")
+    static var title: LocalizedStringResource = "Programma blocco preimpostato"
+    static var description = IntentDescription("Inserisce nel calendario un blocco preimpostato già esistente. Questa azione programma un evento; non crea un nuovo blocco preimpostato.")
 
     @Parameter(title: "Blocco") var block: AgendaBlockEntity
     @Parameter(title: "Inizio", kind: .dateTime) var start: Date
@@ -379,8 +649,10 @@ struct AddReusableBlockToAgendaIntent: AppIntent {
         guard let template = store.templates.first(where: { $0.id == block.id }) else {
             throw AgendaIntentFailure.message("Quel blocco non esiste più. Apri l'app e riprova.")
         }
-        let item = AgendaEvent(id: UUID(), templateID: template.id, name: template.name, durationSlots: template.durationSlots, colorHex: template.colorHex, dateKey: AgendaTime.key(start), startSlot: try AgendaTime.slot(start), reminderMinutes: template.reminderMinutes, location: template.location, notes: template.notes, latitude: template.latitude, longitude: template.longitude, category: template.category, priority: template.priority)
-        try store.insertEvents(store.copies(of: item, firstStart: start, count: template.repeatWeeks ?? 1, intervalDays: 7))
+        let startSlot = try AgendaIntentBridge.slot(for: start)
+        if let error = store.addEvent(template: template, dateKey: AgendaIntentBridge.dateKey(start), startSlot: startSlot) {
+            throw AgendaIntentFailure.message(error)
+        }
         await AgendaIntentBridge.finishMutation(store)
         return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho aggiunto \(template.name) \(AgendaIntentBridge.spokenDateTime(start))."))
     }
@@ -420,21 +692,15 @@ struct AddAgendaEventIntent: AppIntent {
 }
 
 struct CreateReusableBlockIntent: AppIntent {
-    static var title: LocalizedStringResource = "Crea blocco riutilizzabile"
-    static var description = IntentDescription("Crea un nuovo blocco da riutilizzare nell'agenda.")
+    static var title: LocalizedStringResource = "Crea blocco preimpostato"
+    static var description = IntentDescription("Crea soltanto un nuovo blocco preimpostato e riutilizzabile. Non crea un evento e non richiede una data o un orario.")
 
-    @Parameter(title: "Nome") var name: String
+    @Parameter(title: "Nome del blocco") var name: String
     @Parameter(title: "Durata in minuti", default: 60) var durationMinutes: Int
     @Parameter(title: "Colore", default: .azzurro) var color: AgendaColorChoice
     @Parameter(title: "Luogo") var location: String?
     @Parameter(title: "Promemoria, minuti prima") var reminderMinutes: Int?
     @Parameter(title: "Ripeti per quante settimane") var repeatWeeks: Int?
-
-    @Parameter(title: "Note") var notes: String?
-    @Parameter(title: "Latitudine") var latitude: Double?
-    @Parameter(title: "Longitudine") var longitude: Double?
-    @Parameter(title: "Categoria") var category: String?
-    @Parameter(title: "Priorità da 0 a 3") var priority: Int?
 
     static var parameterSummary: some ParameterSummary {
         Summary("Crea il blocco \(\.$name) di \(\.$durationMinutes) minuti")
@@ -449,12 +715,16 @@ struct CreateReusableBlockIntent: AppIntent {
             throw AgendaIntentFailure.message("Esiste già un blocco chiamato \(trimmed).")
         }
         let duration = try AgendaIntentBridge.slots(minutes: durationMinutes)
-        guard store.cacheHealthy else { throw AgendaOperationError.invalid("Apri l'app per ripristinare la cache.") }
-        try AgendaTime.metadata(reminder: reminderMinutes, latitude: latitude, longitude: longitude, priority: priority)
-        if let repeatWeeks, !(1...104).contains(repeatWeeks) { throw AgendaOperationError.invalid("Indica da 1 a 104 settimane.") }
-        store.templates.append(BlockTemplate(id: UUID(), name: trimmed, durationSlots: duration, colorHex: color.hex, repeatWeeks: repeatWeeks, reminderMinutes: reminderMinutes, location: location, notes: notes, latitude: latitude, longitude: longitude, category: category, priority: priority))
+        store.addTemplate(
+            name: trimmed,
+            durationSlots: duration,
+            colorHex: color.hex,
+            repeatWeeks: repeatWeeks.map { max(1, $0) },
+            reminderMinutes: reminderMinutes.map { max(0, $0) },
+            location: location
+        )
         await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Ho creato il blocco \(trimmed), durata \(AgendaIntentBridge.durationText(slots: duration))."))
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho creato il blocco preimpostato \(trimmed), durata \(AgendaIntentBridge.durationText(slots: duration)). Non l’ho inserito nel calendario."))
     }
 }
 
@@ -466,6 +736,9 @@ struct EditReusableBlockIntent: AppIntent {
     @Parameter(title: "Nuovo nome") var newName: String?
     @Parameter(title: "Nuova durata in minuti") var durationMinutes: Int?
     @Parameter(title: "Nuovo colore") var color: AgendaColorChoice?
+    @Parameter(title: "Luogo predefinito") var location: String?
+    @Parameter(title: "Promemoria predefinito, minuti prima") var reminderMinutes: Int?
+    @Parameter(title: "Ripeti per quante settimane") var repeatWeeks: Int?
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
@@ -479,6 +752,12 @@ struct EditReusableBlockIntent: AppIntent {
         }
         if let durationMinutes { template.durationSlots = try AgendaIntentBridge.slots(minutes: durationMinutes) }
         if let color { template.colorHex = color.hex }
+        if let location {
+            let trimmed = location.trimmingCharacters(in: .whitespacesAndNewlines)
+            template.location = trimmed.isEmpty ? nil : trimmed
+        }
+        if let reminderMinutes { template.reminderMinutes = max(0, reminderMinutes) }
+        if let repeatWeeks { template.repeatWeeks = max(1, repeatWeeks) }
         store.updateTemplate(template)
         await AgendaIntentBridge.finishMutation(store)
         return .result(dialog: AgendaIntentBridge.dialog("Blocco \(template.name) aggiornato."))
@@ -558,11 +837,9 @@ struct EditAgendaEventIntent: AppIntent {
         if let location {
             let trimmed = location.trimmingCharacters(in: .whitespacesAndNewlines)
             updated.location = trimmed.isEmpty ? nil : trimmed
-            updated.latitude = nil
-            updated.longitude = nil
         }
-        if let reminderMinutes { updated.reminderMinutes = reminderMinutes }
-        try store.commitEvent(updated)
+        if let reminderMinutes { updated.reminderMinutes = max(0, reminderMinutes) }
+        if let error = store.updateEvent(updated) { throw AgendaIntentFailure.message(error) }
         await AgendaIntentBridge.finishMutation(store)
         return .result(dialog: AgendaIntentBridge.dialog("Impegno \(updated.name) aggiornato."))
     }
@@ -755,1076 +1032,728 @@ struct SyncAgendaIntent: AppIntent {
     }
 }
 
-struct AgendaAppShortcuts: AppShortcutsProvider {
-    // Apple permits at most ten automatic shortcuts; every AppIntent remains available in Shortcuts.
-    static var appShortcuts: [AppShortcut] {
-        AppShortcut(intent: AddReusableBlockToAgendaIntent(),
-            phrases: ["Aggiungi \(\.$block) in \(.applicationName)", "Pianifica \(\.$block) con \(.applicationName)"],
-            shortTitle: "Aggiungi blocco", systemImageName: "calendar.badge.plus")
-        AppShortcut(intent: CreateAdvancedAgendaIntent(),
-            phrases: ["Aggiungi un impegno in \(.applicationName)", "Crea un impegno con \(.applicationName)", "Metti un impegno in \(.applicationName)"],
-            shortTitle: "Nuovo impegno", systemImageName: "plus.rectangle.on.rectangle")
-        AppShortcut(intent: MoveAgendaEventIntent(),
-            phrases: ["Sposta un impegno in \(.applicationName)"],
-            shortTitle: "Sposta impegno", systemImageName: "arrow.right")
-        AppShortcut(intent: Delay15AgendaIntent(),
-            phrases: ["Sposta \(\.$event) avanti di 15 minuti in \(.applicationName)", "Posticipa \(\.$event) di un quarto d’ora in \(.applicationName)"],
-            shortTitle: "Posticipa 15 minuti", systemImageName: "arrow.forward")
-        AppShortcut(intent: Advance30AgendaIntent(),
-            phrases: ["Anticipa \(\.$event) di mezz’ora in \(.applicationName)", "Sposta \(\.$event) indietro di 30 minuti in \(.applicationName)"],
-            shortTitle: "Anticipa mezz’ora", systemImageName: "arrow.backward")
-        AppShortcut(intent: Extend30AgendaIntent(),
-            phrases: ["Allunga \(\.$event) di 30 minuti in \(.applicationName)"],
-            shortTitle: "Allunga 30 minuti", systemImageName: "arrow.up.and.down")
-        AppShortcut(intent: OpenNextEventMapsIntent(),
-            phrases: ["Apri il luogo del prossimo impegno in Mappe con \(.applicationName)"],
-            shortTitle: "Luogo prossimo impegno", systemImageName: "map")
-        AppShortcut(intent: ItalianAgendaCommandIntent(),
-            phrases: ["Esegui un comando in \(.applicationName)", "Gestisci la mia agenda con \(.applicationName)"],
-            shortTitle: "Comando in italiano", systemImageName: "waveform")
-        AppShortcut(intent: AgendaForDayIntent(),
-            phrases: ["Cosa ho oggi in \(.applicationName)", "Mostra la mia giornata in \(.applicationName)"],
-            shortTitle: "Agenda del giorno", systemImageName: "calendar")
-        AppShortcut(intent: SyncAgendaIntent(),
-            phrases: ["Sincronizza \(.applicationName)"],
-            shortTitle: "Sincronizza", systemImageName: "arrow.triangle.2.circlepath")
-    }
-    static var shortcutTileColor: ShortcutTileColor { .blue }
-}
 
-// MARK: - v5.6 extended actions
+struct ShiftAgendaEventByMinutesIntent: AppIntent {
+    static var title: LocalizedStringResource = "Sposta impegno di minuti"
+    static var description = IntentDescription("Anticipa o posticipa un impegno di 15, 30, 45, 60 minuti o di un valore personalizzato, mantenendo la stessa durata.")
 
-struct DelayCustomAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Posticipa impegno di minuti personalizzati"
-    static var description = IntentDescription("Posticipa impegno di minuti personalizzati. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
     @Parameter(title: "Impegno") var event: AgendaEventEntity
     @Parameter(title: "Minuti", default: 15) var minutes: Int
+    @Parameter(title: "Direzione", default: .avanti) var direction: AgendaShiftDirection
 
-    static var parameterSummary: some ParameterSummary { Summary("Posticipa \(\.$event) di \(\.$minutes) minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        guard (15...525600).contains(minutes) else { throw AgendaOperationError.invalid("Indica un numero positivo di minuti, massimo 525600.") }
-        let updated = try store.shifted(store.requireEvent(event.id), minutes: minutes)
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
+    static var parameterSummary: some ParameterSummary {
+        Summary("Sposta \(\.$event) \(\.$direction) di \(\.$minutes) minuti")
     }
-}
-
-struct Delay15AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Posticipa impegno di 15 minuti"
-    static var description = IntentDescription("Posticipa impegno di 15 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Posticipa \(\.$event) di 15 minuti") }
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let store = AgendaIntentBridge.makeStore()
-        let updated = try store.shifted(store.requireEvent(event.id), minutes: 15)
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Delay30AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Posticipa impegno di 30 minuti"
-    static var description = IntentDescription("Posticipa impegno di 30 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Posticipa \(\.$event) di 30 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let updated = try store.shifted(store.requireEvent(event.id), minutes: 30)
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Delay45AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Posticipa impegno di 45 minuti"
-    static var description = IntentDescription("Posticipa impegno di 45 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Posticipa \(\.$event) di 45 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let updated = try store.shifted(store.requireEvent(event.id), minutes: 45)
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Delay60AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Posticipa impegno di 60 minuti"
-    static var description = IntentDescription("Posticipa impegno di 60 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Posticipa \(\.$event) di 60 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let updated = try store.shifted(store.requireEvent(event.id), minutes: 60)
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct AdvanceCustomAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Anticipa impegno di minuti personalizzati"
-    static var description = IntentDescription("Anticipa impegno di minuti personalizzati. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Minuti", default: 15) var minutes: Int
-
-    static var parameterSummary: some ParameterSummary { Summary("Anticipa \(\.$event) di \(\.$minutes) minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        guard (15...525600).contains(minutes) else { throw AgendaOperationError.invalid("Indica un numero positivo di minuti, massimo 525600.") }
-        let updated = try store.shifted(store.requireEvent(event.id), minutes: -minutes)
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Advance15AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Anticipa impegno di 15 minuti"
-    static var description = IntentDescription("Anticipa impegno di 15 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Anticipa \(\.$event) di 15 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let updated = try store.shifted(store.requireEvent(event.id), minutes: -15)
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Advance30AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Anticipa impegno di 30 minuti"
-    static var description = IntentDescription("Anticipa impegno di 30 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Anticipa \(\.$event) di 30 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let updated = try store.shifted(store.requireEvent(event.id), minutes: -30)
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Advance45AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Anticipa impegno di 45 minuti"
-    static var description = IntentDescription("Anticipa impegno di 45 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Anticipa \(\.$event) di 45 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let updated = try store.shifted(store.requireEvent(event.id), minutes: -45)
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Advance60AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Anticipa impegno di 60 minuti"
-    static var description = IntentDescription("Anticipa impegno di 60 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Anticipa \(\.$event) di 60 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let updated = try store.shifted(store.requireEvent(event.id), minutes: -60)
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct ExtendCustomAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Allunga impegno di minuti personalizzati"
-    static var description = IntentDescription("Allunga impegno di minuti personalizzati. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Minuti", default: 30) var minutes: Int
-
-    static var parameterSummary: some ParameterSummary { Summary("Allunga \(\.$event) di \(\.$minutes) minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        let change = try AgendaTime.slots(minutes)
-        updated.durationSlots += change
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Extend15AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Allunga impegno di 15 minuti"
-    static var description = IntentDescription("Allunga impegno di 15 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Allunga \(\.$event) di 15 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        let change = try AgendaTime.slots(15)
-        updated.durationSlots += change
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Extend30AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Allunga impegno di 30 minuti"
-    static var description = IntentDescription("Allunga impegno di 30 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Allunga \(\.$event) di 30 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        let change = try AgendaTime.slots(30)
-        updated.durationSlots += change
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Extend60AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Allunga impegno di 60 minuti"
-    static var description = IntentDescription("Allunga impegno di 60 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Allunga \(\.$event) di 60 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        let change = try AgendaTime.slots(60)
-        updated.durationSlots += change
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct ShortenCustomAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Accorcia impegno di minuti personalizzati"
-    static var description = IntentDescription("Accorcia impegno di minuti personalizzati. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Minuti", default: 30) var minutes: Int
-
-    static var parameterSummary: some ParameterSummary { Summary("Accorcia \(\.$event) di \(\.$minutes) minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        let change = try AgendaTime.slots(minutes)
-        updated.durationSlots -= change
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Shorten15AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Accorcia impegno di 15 minuti"
-    static var description = IntentDescription("Accorcia impegno di 15 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Accorcia \(\.$event) di 15 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        let change = try AgendaTime.slots(15)
-        updated.durationSlots -= change
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Shorten30AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Accorcia impegno di 30 minuti"
-    static var description = IntentDescription("Accorcia impegno di 30 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Accorcia \(\.$event) di 30 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        let change = try AgendaTime.slots(30)
-        updated.durationSlots -= change
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct Shorten60AgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Accorcia impegno di 60 minuti"
-    static var description = IntentDescription("Accorcia impegno di 60 minuti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-    static var parameterSummary: some ParameterSummary { Summary("Accorcia \(\.$event) di 60 minuti") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        let change = try AgendaTime.slots(60)
-        updated.durationSlots -= change
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct DuplicateAtDateAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Duplica impegno"
-    static var description = IntentDescription("Duplica impegno. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Inizio della copia", kind: .dateTime) var start: Date
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let original = try store.requireEvent(event.id)
-        try store.insertEvents(store.copies(of: original, firstStart: start, count: 1, intervalDays: 1))
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct DuplicateTomorrowAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Duplica impegno al giorno successivo"
-    static var description = IntentDescription("Duplica impegno al giorno successivo. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let original = try store.requireEvent(event.id)
-        let moved = try store.shifted(original, minutes: 1440)
-        let start = try AgendaTime.date(key: moved.dateKey, slot: moved.startSlot)
-        try store.insertEvents(store.copies(of: original, firstStart: start, count: 1, intervalDays: 1))
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct DuplicateNextWeekAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Duplica impegno alla settimana successiva"
-    static var description = IntentDescription("Duplica impegno alla settimana successiva. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let original = try store.requireEvent(event.id)
-        let moved = try store.shifted(original, minutes: 10080)
-        let start = try AgendaTime.date(key: moved.dateKey, slot: moved.startSlot)
-        try store.insertEvents(store.copies(of: original, firstStart: start, count: 1, intervalDays: 1))
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct SetStartOnlyAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Cambia solo inizio impegno"
-    static var description = IntentDescription("Cambia solo inizio impegno. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Nuovo inizio", kind: .dateTime) var start: Date
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        guard AgendaTime.key(start) == updated.dateKey else { throw AgendaOperationError.invalid("Per cambiare giorno usa Sposta impegno. La fine resta fissa.") }
-        let endSlot = updated.startSlot + updated.durationSlots
-        updated.startSlot = try AgendaTime.slot(start)
-        updated.durationSlots = endSlot - updated.startSlot
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct SetEndOnlyAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Cambia solo fine impegno"
-    static var description = IntentDescription("Cambia solo fine impegno. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Nuova fine", kind: .dateTime) var end: Date
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        let midnight = try AgendaTime.date(key: updated.dateKey, slot: 64)
-        let endSlot: Int
-        if end == midnight { endSlot = 64 }
-        else {
-            guard AgendaTime.key(end) == updated.dateKey else { throw AgendaOperationError.invalid("La fine deve essere nello stesso giorno o a mezzanotte.") }
-            endSlot = try AgendaTime.slot(end)
+        guard let existing = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
         }
-        updated.durationSlots = endSlot - updated.startSlot
-        try store.commitEvent(updated)
+        guard minutes > 0 else { throw AgendaIntentFailure.message("I minuti devono essere maggiori di zero.") }
+        let delta = direction.sign * minutes
+        let newStart = try AgendaIntentBridge.dateByShifting(existing, minutes: delta)
+        let newSlot = try AgendaIntentBridge.slot(for: newStart)
+        if let error = store.moveEvent(id: existing.id, toDateKey: AgendaIntentBridge.dateKey(newStart), startSlot: newSlot) {
+            throw AgendaIntentFailure.message(error)
+        }
         await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
+        let verb = direction == .avanti ? "posticipato" : "anticipato"
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho \(verb) \(existing.name) di \(minutes) minuti. Ora inizia alle \(AgendaIntentBridge.timeText(slot: newSlot))."))
     }
 }
 
-struct SetReminderAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Aggiungi o cambia promemoria"
-    static var description = IntentDescription("Aggiungi o cambia promemoria. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Minuti prima", default: 15) var minutes: Int
+struct ExtendAgendaEventIntent: AppIntent {
+    static var title: LocalizedStringResource = "Allunga impegno"
+    static var description = IntentDescription("Allunga la durata di un impegno senza cambiarne l'ora di inizio.")
 
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+    @Parameter(title: "Minuti da aggiungere", default: 15) var minutes: Int
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        updated.reminderMinutes = minutes
-        try store.commitEvent(updated)
+        guard var updated = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
+        let extra = try AgendaIntentBridge.slots(minutes: minutes)
+        updated.durationSlots += extra
+        if let error = store.updateEvent(updated) { throw AgendaIntentFailure.message(error) }
         await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho allungato \(updated.name) di \(minutes) minuti. Ora termina alle \(AgendaIntentBridge.timeText(slot: updated.startSlot + updated.durationSlots))."))
     }
 }
 
-struct RemoveReminderAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Rimuovi promemoria"
-    static var description = IntentDescription("Rimuovi promemoria. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
+struct ShortenAgendaEventIntent: AppIntent {
+    static var title: LocalizedStringResource = "Accorcia impegno"
+    static var description = IntentDescription("Accorcia la durata di un impegno mantenendo lo stesso inizio.")
 
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+    @Parameter(title: "Minuti da togliere", default: 15) var minutes: Int
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
+        guard var updated = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
+        let reduction = try AgendaIntentBridge.slots(minutes: minutes)
+        guard updated.durationSlots - reduction >= 1 else {
+            throw AgendaIntentFailure.message("La durata minima è 15 minuti.")
+        }
+        updated.durationSlots -= reduction
+        if let error = store.updateEvent(updated) { throw AgendaIntentFailure.message(error) }
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho accorciato \(updated.name) di \(minutes) minuti. Ora termina alle \(AgendaIntentBridge.timeText(slot: updated.startSlot + updated.durationSlots))."))
+    }
+}
+
+struct DuplicateAgendaEventIntent: AppIntent {
+    static var title: LocalizedStringResource = "Duplica impegno"
+    static var description = IntentDescription("Crea una copia di un impegno in una nuova data e ora.")
+
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+    @Parameter(title: "Nuovo inizio", kind: .dateTime) var newStart: Date
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard let existing = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
+        let slot = try AgendaIntentBridge.slot(for: newStart)
+        let created = try AgendaIntentBridge.duplicateEvent(existing, in: store, dateKey: AgendaIntentBridge.dateKey(newStart), startSlot: slot)
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho duplicato \(created.name) \(AgendaIntentBridge.spokenDateTime(newStart))."))
+    }
+}
+
+struct DuplicateAgendaEventTomorrowIntent: AppIntent {
+    static var title: LocalizedStringResource = "Duplica impegno domani"
+    static var description = IntentDescription("Duplica un impegno domani alla stessa ora.")
+
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard let existing = store.events.first(where: { $0.id == event.id }),
+              let sourceDate = AgendaIntentBridge.eventDate(existing),
+              let target = Calendar.current.date(byAdding: .day, value: 1, to: sourceDate) else {
+            throw AgendaIntentFailure.message("Non riesco a duplicare quell'impegno.")
+        }
+        let created = try AgendaIntentBridge.duplicateEvent(existing, in: store, dateKey: AgendaIntentBridge.dateKey(target), startSlot: existing.startSlot)
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho copiato \(created.name) a domani alla stessa ora."))
+    }
+}
+
+struct DuplicateAgendaEventNextWeekIntent: AppIntent {
+    static var title: LocalizedStringResource = "Duplica impegno settimana prossima"
+    static var description = IntentDescription("Duplica un impegno sette giorni dopo alla stessa ora.")
+
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard let existing = store.events.first(where: { $0.id == event.id }),
+              let sourceDate = AgendaIntentBridge.eventDate(existing),
+              let target = Calendar.current.date(byAdding: .day, value: 7, to: sourceDate) else {
+            throw AgendaIntentFailure.message("Non riesco a duplicare quell'impegno.")
+        }
+        let created = try AgendaIntentBridge.duplicateEvent(existing, in: store, dateKey: AgendaIntentBridge.dateKey(target), startSlot: existing.startSlot)
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho copiato \(created.name) alla settimana prossima, alla stessa ora."))
+    }
+}
+
+struct CopyAgendaEventToDateIntent: AppIntent {
+    static var title: LocalizedStringResource = "Copia impegno in un altro giorno"
+    static var description = IntentDescription("Copia un impegno in un giorno specifico mantenendo lo stesso orario e la stessa durata.")
+
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+    @Parameter(title: "Nuovo giorno", kind: .date) var date: Date
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard let existing = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
+        let created = try AgendaIntentBridge.duplicateEvent(existing, in: store, dateKey: AgendaIntentBridge.dateKey(date), startSlot: existing.startSlot)
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho copiato \(created.name) nel giorno richiesto alle \(AgendaIntentBridge.timeText(slot: created.startSlot))."))
+    }
+}
+
+struct SetEventReminderIntent: AppIntent {
+    static var title: LocalizedStringResource = "Imposta promemoria impegno"
+    static var description = IntentDescription("Aggiunge o cambia il promemoria di un impegno.")
+
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+    @Parameter(title: "Minuti prima", default: 15) var minutesBefore: Int
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard var updated = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
+        updated.reminderMinutes = max(0, minutesBefore)
+        if let error = store.updateEvent(updated) { throw AgendaIntentFailure.message(error) }
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ti ricorderò \(updated.name) \(max(0, minutesBefore)) minuti prima."))
+    }
+}
+
+struct RemoveEventReminderIntent: AppIntent {
+    static var title: LocalizedStringResource = "Rimuovi promemoria impegno"
+    static var description = IntentDescription("Rimuove il promemoria da un impegno.")
+
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard var updated = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
         updated.reminderMinutes = nil
-        try store.commitEvent(updated)
+        if let error = store.updateEvent(updated) { throw AgendaIntentFailure.message(error) }
         await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho rimosso il promemoria da \(updated.name)."))
     }
 }
 
-struct SetLocationAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Cambia luogo e coordinate"
-    static var description = IntentDescription("Cambia luogo e coordinate. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
+struct SetEventLocationIntent: AppIntent {
+    static var title: LocalizedStringResource = "Imposta luogo impegno"
+    static var description = IntentDescription("Aggiunge o cambia il luogo di un impegno.")
+
     @Parameter(title: "Impegno") var event: AgendaEventEntity
     @Parameter(title: "Luogo") var location: String
-    @Parameter(title: "Latitudine") var latitude: Double?
-    @Parameter(title: "Longitudine") var longitude: Double?
-
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        updated.location = location.trimmingCharacters(in: .whitespacesAndNewlines)
-        updated.latitude = latitude
-        updated.longitude = longitude
-        try store.commitEvent(updated)
+        guard var updated = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
+        let trimmed = location.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw AgendaIntentFailure.message("Dimmi un luogo.") }
+        updated.location = trimmed
+        if let error = store.updateEvent(updated) { throw AgendaIntentFailure.message(error) }
         await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Il luogo di \(updated.name) è \(trimmed)."))
     }
 }
 
-struct RemoveLocationAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Rimuovi luogo e coordinate"
-    static var description = IntentDescription("Rimuovi luogo e coordinate. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
+struct RemoveEventLocationIntent: AppIntent {
+    static var title: LocalizedStringResource = "Rimuovi luogo impegno"
+    static var description = IntentDescription("Rimuove il luogo associato a un impegno.")
 
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
+        guard var updated = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
         updated.location = nil
-        updated.latitude = nil
-        updated.longitude = nil
-        try store.commitEvent(updated)
+        if let error = store.updateEvent(updated) { throw AgendaIntentFailure.message(error) }
         await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho rimosso il luogo da \(updated.name)."))
     }
 }
 
-struct SetNotesAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Scrivi note impegno"
-    static var description = IntentDescription("Scrivi note impegno. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Note") var notes: String
+struct ChangeEventStartIntent: AppIntent {
+    static var title: LocalizedStringResource = "Cambia inizio impegno"
+    static var description = IntentDescription("Cambia soltanto l'ora o il giorno di inizio di un impegno e mantiene invariata la durata.")
 
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+    @Parameter(title: "Nuovo inizio", kind: .dateTime) var newStart: Date
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        updated.notes = notes
-        try store.commitEvent(updated)
+        guard let existing = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
+        let slot = try AgendaIntentBridge.slot(for: newStart)
+        if let error = store.moveEvent(id: existing.id, toDateKey: AgendaIntentBridge.dateKey(newStart), startSlot: slot) {
+            throw AgendaIntentFailure.message(error)
+        }
         await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. \(existing.name) ora inizia \(AgendaIntentBridge.spokenDateTime(newStart))."))
     }
 }
 
-struct AppendNotesAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Aggiungi testo alle note"
-    static var description = IntentDescription("Aggiungi testo alle note. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Testo da aggiungere") var text: String
+struct ChangeEventEndIntent: AppIntent {
+    static var title: LocalizedStringResource = "Cambia fine impegno"
+    static var description = IntentDescription("Cambia l'ora di fine di un impegno lasciando invariato l'inizio.")
 
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+    @Parameter(title: "Nuova fine", kind: .dateTime) var newEnd: Date
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        updated.notes = [updated.notes, text].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")
-        try store.commitEvent(updated)
+        guard var updated = store.events.first(where: { $0.id == event.id }),
+              let start = AgendaIntentBridge.eventDate(updated) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
+        updated.durationSlots = try AgendaIntentBridge.slots(from: start, to: newEnd)
+        if let error = store.updateEvent(updated) { throw AgendaIntentFailure.message(error) }
         await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. \(updated.name) ora termina alle \(AgendaIntentBridge.timeText(slot: updated.startSlot + updated.durationSlots))."))
     }
 }
 
-struct ClearNotesAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Cancella note impegno"
-    static var description = IntentDescription("Cancella note impegno. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
+struct ScheduleBlockNextFreeIntent: AppIntent {
+    static var title: LocalizedStringResource = "Metti blocco nel prossimo spazio libero"
+    static var description = IntentDescription("Trova il primo spazio libero in una giornata e ci inserisce un blocco preimpostato.")
 
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        updated.notes = nil
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct MarkNotesAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Segna nota completata"
-    static var description = IntentDescription("Segna nota completata. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Nota da marcare") var text: String
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw AgendaOperationError.invalid("Indica la nota completata.") }
-        updated.notes = [updated.notes, "✓ " + text].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct SetColorAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Cambia colore impegno"
-    static var description = IntentDescription("Cambia colore impegno. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Colore") var color: AgendaColorChoice
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        updated.colorHex = color.hex
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct SetCategoryAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Cambia categoria impegno"
-    static var description = IntentDescription("Cambia categoria impegno. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Categoria (vuota per rimuovere)") var category: String
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        updated.category = category.isEmpty ? nil : category
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct SetPriorityAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Cambia priorità impegno"
-    static var description = IntentDescription("Cambia priorità impegno. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Priorità da 0 a 3", default: 2) var priority: Int
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        updated.priority = priority
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct SetAssociatedBlockAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Cambia blocco associato"
-    static var description = IntentDescription("Cambia blocco associato. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
     @Parameter(title: "Blocco") var block: AgendaBlockEntity
-    @Parameter(title: "Usa anche nome e colore del blocco", default: true) var useAppearance: Bool
-
+    @Parameter(title: "Giorno", kind: .date) var date: Date
+    @Parameter(title: "Dalle ore", default: 8) var fromHour: Int
+    @Parameter(title: "Alle ore", default: 20) var toHour: Int
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        guard let template = store.template(id: block.id) else { throw AgendaOperationError.invalid("Blocco non trovato.") }
-        updated.templateID = template.id
-        if useAppearance { updated.name = template.name; updated.colorHex = template.colorHex }
-        try store.commitEvent(updated)
+        guard let template = store.templates.first(where: { $0.id == block.id }) else {
+            throw AgendaIntentFailure.message("Quel blocco non esiste più.")
+        }
+        guard let slot = try AgendaIntentBridge.nextFreeStart(store: store, date: date, durationSlots: template.durationSlots, fromHour: fromHour, toHour: toHour) else {
+            throw AgendaIntentFailure.message("Non trovo uno spazio libero abbastanza lungo in quell'intervallo.")
+        }
+        if let error = store.addEvent(template: template, dateKey: AgendaIntentBridge.dateKey(date), startSlot: slot) {
+            throw AgendaIntentFailure.message(error)
+        }
         await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho messo \(template.name) nel primo spazio libero, dalle \(AgendaIntentBridge.timeText(slot: slot)) alle \(AgendaIntentBridge.timeText(slot: slot + template.durationSlots))."))
     }
 }
 
-struct ReadNotesAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Leggi note e dettagli impegno"
-    static var description = IntentDescription("Leggi note e dettagli impegno. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
+struct MoveEventNextFreeIntent: AppIntent {
+    static var title: LocalizedStringResource = "Sposta impegno al prossimo spazio libero"
+    static var description = IntentDescription("Sposta un impegno nel primo spazio libero disponibile, mantenendo la stessa durata.")
 
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+    @Parameter(title: "Giorno", kind: .date) var date: Date
+    @Parameter(title: "Dalle ore", default: 8) var fromHour: Int
+    @Parameter(title: "Alle ore", default: 20) var toHour: Int
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard let existing = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
+        guard let slot = try AgendaIntentBridge.nextFreeStart(store: store, date: date, durationSlots: existing.durationSlots, fromHour: fromHour, toHour: toHour, excluding: existing.id) else {
+            throw AgendaIntentFailure.message("Non trovo uno spazio libero abbastanza lungo in quell'intervallo.")
+        }
+        if let error = store.moveEvent(id: existing.id, toDateKey: AgendaIntentBridge.dateKey(date), startSlot: slot) {
+            throw AgendaIntentFailure.message(error)
+        }
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho spostato \(existing.name) nel primo spazio libero, alle \(AgendaIntentBridge.timeText(slot: slot))."))
+    }
+}
+
+struct AddCustomEventNextFreeIntent: AppIntent {
+    static var title: LocalizedStringResource = "Crea impegno nel prossimo spazio libero"
+    static var description = IntentDescription("Crea un nuovo impegno nel primo spazio libero disponibile in una giornata.")
+
+    @Parameter(title: "Nome") var name: String
+    @Parameter(title: "Durata in minuti", default: 60) var durationMinutes: Int
+    @Parameter(title: "Giorno", kind: .date) var date: Date
+    @Parameter(title: "Dalle ore", default: 8) var fromHour: Int
+    @Parameter(title: "Alle ore", default: 20) var toHour: Int
+    @Parameter(title: "Colore", default: .azzurro) var color: AgendaColorChoice
+    @Parameter(title: "Luogo") var location: String?
+    @Parameter(title: "Promemoria, minuti prima") var reminderMinutes: Int?
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        let duration = try AgendaIntentBridge.slots(minutes: durationMinutes)
+        guard let slot = try AgendaIntentBridge.nextFreeStart(store: store, date: date, durationSlots: duration, fromHour: fromHour, toHour: toHour) else {
+            throw AgendaIntentFailure.message("Non trovo uno spazio libero abbastanza lungo in quell'intervallo.")
+        }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw AgendaIntentFailure.message("Dimmi un nome per l'impegno.") }
+        let template = BlockTemplate(
+            id: UUID(),
+            name: trimmed,
+            durationSlots: duration,
+            colorHex: color.hex,
+            repeatWeeks: nil,
+            reminderMinutes: reminderMinutes.map { max(0, $0) },
+            location: location
+        )
+        if let error = store.addEvent(template: template, dateKey: AgendaIntentBridge.dateKey(date), startSlot: slot) {
+            throw AgendaIntentFailure.message(error)
+        }
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho inserito \(trimmed) nel primo spazio libero alle \(AgendaIntentBridge.timeText(slot: slot))."))
+    }
+}
+
+struct CreateBlockFromEventIntent: AppIntent {
+    static var title: LocalizedStringResource = "Crea blocco da impegno"
+    static var description = IntentDescription("Salva un impegno esistente come nuovo blocco preimpostato riutilizzabile.")
+
+    @Parameter(title: "Impegno") var event: AgendaEventEntity
+    @Parameter(title: "Nome del blocco") var newName: String?
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard let existing = store.events.first(where: { $0.id == event.id }) else {
+            throw AgendaIntentFailure.message("Quell'impegno non esiste più.")
+        }
+        let name = (newName ?? existing.name).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw AgendaIntentFailure.message("Dimmi un nome per il blocco.") }
+        if AgendaIntentBridge.matchingTemplate(named: name, in: store) != nil {
+            throw AgendaIntentFailure.message("Esiste già un blocco chiamato \(name).")
+        }
+        store.addTemplate(
+            name: name,
+            durationSlots: existing.durationSlots,
+            colorHex: existing.colorHex,
+            repeatWeeks: existing.repeatWeeks,
+            reminderMinutes: existing.reminderMinutes,
+            location: existing.location
+        )
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho salvato \(name) come blocco preimpostato riutilizzabile."))
+    }
+}
+
+struct SetReusableBlockReminderIntent: AppIntent {
+    static var title: LocalizedStringResource = "Imposta promemoria del blocco"
+    static var description = IntentDescription("Imposta il promemoria predefinito per i nuovi impegni creati da un blocco riutilizzabile.")
+
+    @Parameter(title: "Blocco") var block: AgendaBlockEntity
+    @Parameter(title: "Minuti prima", default: 15) var minutesBefore: Int
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard var template = store.templates.first(where: { $0.id == block.id }) else {
+            throw AgendaIntentFailure.message("Quel blocco non esiste più.")
+        }
+        template.reminderMinutes = max(0, minutesBefore)
+        store.updateTemplate(template)
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Il blocco \(template.name) avrà un promemoria \(max(0, minutesBefore)) minuti prima."))
+    }
+}
+
+struct RemoveReusableBlockReminderIntent: AppIntent {
+    static var title: LocalizedStringResource = "Rimuovi promemoria del blocco"
+    static var description = IntentDescription("Rimuove il promemoria predefinito da un blocco riutilizzabile.")
+
+    @Parameter(title: "Blocco") var block: AgendaBlockEntity
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard var template = store.templates.first(where: { $0.id == block.id }) else {
+            throw AgendaIntentFailure.message("Quel blocco non esiste più.")
+        }
+        template.reminderMinutes = nil
+        store.updateTemplate(template)
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho rimosso il promemoria predefinito dal blocco \(template.name)."))
+    }
+}
+
+struct SetReusableBlockLocationIntent: AppIntent {
+    static var title: LocalizedStringResource = "Imposta luogo del blocco"
+    static var description = IntentDescription("Imposta il luogo predefinito per un blocco riutilizzabile.")
+
+    @Parameter(title: "Blocco") var block: AgendaBlockEntity
+    @Parameter(title: "Luogo") var location: String
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard var template = store.templates.first(where: { $0.id == block.id }) else {
+            throw AgendaIntentFailure.message("Quel blocco non esiste più.")
+        }
+        let trimmed = location.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw AgendaIntentFailure.message("Dimmi un luogo.") }
+        template.location = trimmed
+        store.updateTemplate(template)
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Il luogo predefinito di \(template.name) è \(trimmed)."))
+    }
+}
+
+struct RemoveReusableBlockLocationIntent: AppIntent {
+    static var title: LocalizedStringResource = "Rimuovi luogo del blocco"
+    static var description = IntentDescription("Rimuove il luogo predefinito da un blocco riutilizzabile.")
+
+    @Parameter(title: "Blocco") var block: AgendaBlockEntity
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let store = AgendaIntentBridge.makeStore()
+        guard var template = store.templates.first(where: { $0.id == block.id }) else {
+            throw AgendaIntentFailure.message("Quel blocco non esiste più.")
+        }
+        template.location = nil
+        store.updateTemplate(template)
+        await AgendaIntentBridge.finishMutation(store)
+        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Ho rimosso il luogo predefinito dal blocco \(template.name)."))
+    }
+}
+
+struct AskAgendaIntent: AppIntent {
+    static var title: LocalizedStringResource = "Parla con Agenda a Blocchi"
+    static var description = IntentDescription("Interpreta una richiesta in italiano e usa le funzioni di Agenda a Blocchi senza obbligarti a ricordare il nome esatto di ogni comando.")
+
+    @Parameter(title: "Cosa vuoi fare") var request: String
+
+    static var parameterSummary: some ParameterSummary {
+        Summary("In Agenda a Blocchi: \(\.$request)")
+    }
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog & ReturnsValue<String> {
         let store = AgendaIntentBridge.makeStore()
-        let item = try store.requireEvent(event.id)
-        let answer = "\(item.name). Note: \(item.notes ?? "nessuna"). Categoria: \(item.category ?? "nessuna"). Priorità: \(item.priority ?? 0). Luogo: \(item.location ?? "nessuno"). Promemoria: " + (item.reminderMinutes.map { "\($0) minuti prima" } ?? "nessuno")
-
-        return .result(value: answer, dialog: AgendaIntentBridge.dialog(answer))
-    }
-}
-
-struct CreateRecurringCopiesAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Crea più copie ricorrenti"
-    static var description = IntentDescription("Crea più copie ricorrenti. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Inizio prima copia", kind: .dateTime) var start: Date
-    @Parameter(title: "Numero copie", default: 4) var count: Int
-    @Parameter(title: "Intervallo in giorni", default: 7) var intervalDays: Int
+        let value = AgendaIntentBridge.normalized(request)
 
 
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let original = try store.requireEvent(event.id)
-        try store.insertEvents(store.copies(of: original, firstStart: start, count: count, intervalDays: intervalDays))
-
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct SkipOccurrenceAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Salta questa occorrenza"
-    static var description = IntentDescription("Salta questa occorrenza. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let item = try store.requireEvent(event.id)
-        guard item.seriesID != nil else { throw AgendaOperationError.invalid("Questo impegno non appartiene a una serie.") }
-        try store.removeEvents([item])
-
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct DeleteDayAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Elimina impegni del giorno con conferma"
-    static var description = IntentDescription("Elimina impegni del giorno con conferma. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Giorno", kind: .date) var date: Date
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let selected = store.events(on: AgendaTime.key(date))
-        guard !selected.isEmpty else { return .result(dialog: AgendaIntentBridge.dialog("Non ci sono impegni da eliminare.")) }
-        let listing = selected.prefix(8).map { $0.name }.joined(separator: ", ")
-        try await requestConfirmation(result: .result(dialog: AgendaIntentBridge.dialog("Eliminare tutti i \(selected.count) impegni del \(AgendaTime.key(date))? \(listing). Le altre date resteranno in agenda.")))
-        // Reload after the system confirmation; never delete data changed in the meantime.
-        let current = AgendaIntentBridge.makeStore()
-        guard current.events(on: AgendaTime.key(date)) == selected else { throw AgendaOperationError.invalid("L'agenda è cambiata durante la conferma. Riprova per confermare l'elenco aggiornato.") }
-        try current.removeEvents(selected)
-        await AgendaIntentBridge.finishMutation(current)
-
-        return .result(dialog: AgendaIntentBridge.dialog("Eliminati \(selected.count) impegni."))
-    }
-}
-
-struct NextFreeSlotAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Trova il prossimo spazio libero"
-    static var description = IntentDescription("Trova il prossimo spazio libero. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Cerca a partire da", kind: .dateTime) var after: Date?
-    @Parameter(title: "Dalle ore", default: 8) var fromHour: Int
-    @Parameter(title: "Alle ore", default: 20) var toHour: Int
-    @Parameter(title: "Giorni da cercare", default: 30) var days: Int
-    @Parameter(title: "Durata in minuti", default: 60) var durationMinutes: Int
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog & ReturnsValue<Date> {
-        let store = AgendaIntentBridge.makeStore()
-        let duration = try AgendaTime.slots(durationMinutes)
-        let start = try store.nextFreeStart(after: after ?? Date(), durationSlots: duration, fromHour: fromHour, toHour: toHour, days: days)
-
-        return .result(value: start, dialog: AgendaIntentBridge.dialog("Spazio libero \(AgendaIntentBridge.spokenDateTime(start)), per \(durationMinutes) minuti."))
-    }
-}
-
-struct MoveToNextFreeSlotAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Sposta impegno al prossimo spazio libero"
-    static var description = IntentDescription("Sposta impegno al prossimo spazio libero. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-    @Parameter(title: "Cerca a partire da", kind: .dateTime) var after: Date?
-    @Parameter(title: "Dalle ore", default: 8) var fromHour: Int
-    @Parameter(title: "Alle ore", default: 20) var toHour: Int
-    @Parameter(title: "Giorni da cercare", default: 30) var days: Int
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        var updated = try store.requireEvent(event.id)
-        let originalStart = try AgendaTime.date(key: updated.dateKey, slot: updated.startSlot)
-        let lowerBound = after ?? max(Date(), originalStart.addingTimeInterval(15 * 60))
-        let start = try store.nextFreeStart(after: lowerBound, durationSlots: updated.durationSlots, fromHour: fromHour, toHour: toHour, days: days, excluding: updated.id)
-        updated.dateKey = AgendaTime.key(start)
-        updated.startSlot = try AgendaTime.slot(start)
-        try store.commitEvent(updated)
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct InsertBlockNextFreeSlotAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Inserisci blocco nel prossimo spazio libero"
-    static var description = IntentDescription("Inserisci blocco nel prossimo spazio libero. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Blocco") var block: AgendaBlockEntity
-    @Parameter(title: "Cerca a partire da", kind: .dateTime) var after: Date?
-    @Parameter(title: "Dalle ore", default: 8) var fromHour: Int
-    @Parameter(title: "Alle ore", default: 20) var toHour: Int
-    @Parameter(title: "Giorni da cercare", default: 30) var days: Int
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        guard let template = store.template(id: block.id) else { throw AgendaOperationError.invalid("Blocco non trovato.") }
-        let start = try store.nextFreeStart(after: after ?? Date(), durationSlots: template.durationSlots, fromHour: fromHour, toHour: toHour, days: days)
-        let item = AgendaEvent(id: UUID(), templateID: template.id, name: template.name, durationSlots: template.durationSlots, colorHex: template.colorHex, dateKey: AgendaTime.key(start), startSlot: try AgendaTime.slot(start), reminderMinutes: template.reminderMinutes, location: template.location, notes: template.notes, latitude: template.latitude, longitude: template.longitude, category: template.category, priority: template.priority)
-        try store.insertEvents([item])
-
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-extension AgendaIntentBridge {
-    static func mapsURL(_ item: AgendaEvent) throws -> URL {
-        try AgendaTime.metadata(reminder: nil, latitude: item.latitude, longitude: item.longitude, priority: nil)
-        var parts = URLComponents(string: "https://maps.apple.com/")!
-        if let lat = item.latitude, let lon = item.longitude {
-            parts.queryItems = [URLQueryItem(name: "ll", value: "\(lat),\(lon)"), URLQueryItem(name: "q", value: item.location ?? item.name)]
-        } else if let text = item.location?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
-            parts.queryItems = [URLQueryItem(name: "q", value: text)]
-        } else { throw AgendaOperationError.invalid("Questo impegno non ha un luogo. Aggiungilo prima di aprire Mappe.") }
-        guard let url = parts.url else { throw AgendaOperationError.invalid("Luogo non valido.") }
-        return url
-    }
-}
-
-struct OpenEventMapsIntent: AppIntent {
-    static var title: LocalizedStringResource = "Apri luogo impegno in Mappe"
-    static var openAppWhenRun: Bool = true
-    static var description = IntentDescription("Apri luogo impegno in Mappe. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Impegno") var event: AgendaEventEntity
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult {
-        let store = AgendaIntentBridge.makeStore()
-        let item = try store.requireEvent(event.id)
-        let url = try AgendaIntentBridge.mapsURL(item)
-
-        guard await UIApplication.shared.open(url, options: [:]) else {
-            throw AgendaOperationError.invalid("Non riesco ad aprire Mappe per questo luogo.")
+        if value.contains("sincron") {
+            await store.synchronize()
+            let text = store.syncError.map { "Sincronizzazione non completata: \($0)" } ?? store.syncStatus
+            AgendaIntentBridge.notifyMutation()
+            return AgendaIntentBridge.spokenResult(text)
         }
-        return .result()
-    }
-}
 
-struct OpenNextEventMapsIntent: AppIntent {
-    static var title: LocalizedStringResource = "Apri il luogo del prossimo impegno in Mappe"
-    static var openAppWhenRun: Bool = true
-    static var description = IntentDescription("Apri il luogo del prossimo impegno in Mappe. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult {
-        let store = AgendaIntentBridge.makeStore()
-        guard let item = store.events.filter({ (AgendaIntentBridge.eventDate($0) ?? .distantPast) >= Date() }).sorted(by: AgendaIntentBridge.eventSort).first else { throw AgendaOperationError.invalid("Non hai impegni futuri.") }
-        let url = try AgendaIntentBridge.mapsURL(item)
-
-        guard await UIApplication.shared.open(url, options: [:]) else {
-            throw AgendaOperationError.invalid("Non riesco ad aprire Mappe per questo luogo.")
+        if value.contains("prossimo impegno") || value.contains("prossimo evento") {
+            let now = Date()
+            let next = store.events.compactMap { event -> (AgendaEvent, Date)? in
+                guard let date = AgendaIntentBridge.eventDate(event), date >= now else { return nil }
+                return (event, date)
+            }.min { $0.1 < $1.1 }
+            let text = next.map { "Il prossimo impegno è \($0.0.name), \(AgendaIntentBridge.spokenDateTime($0.1))." } ?? "Non risultano impegni futuri."
+            return AgendaIntentBridge.spokenResult(text)
         }
-        return .result()
-    }
-}
 
-struct CreateAdvancedAgendaIntent: AppIntent {
-    static var title: LocalizedStringResource = "Crea impegno con durata e opzioni"
-    static var description = IntentDescription("Crea impegno con durata e opzioni. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Nome") var name: String
-    @Parameter(title: "Inizio", kind: .dateTime) var start: Date
-    @Parameter(title: "Nome personalizzato") var customName: String?
-    @Parameter(title: "Fine (alternativa alla durata)", kind: .dateTime) var end: Date?
-    @Parameter(title: "Durata esplicita in minuti") var durationMinutes: Int?
-    @Parameter(title: "Colore") var color: AgendaColorChoice?
-    @Parameter(title: "Luogo") var location: String?
-    @Parameter(title: "Latitudine") var latitude: Double?
-    @Parameter(title: "Longitudine") var longitude: Double?
-    @Parameter(title: "Note") var notes: String?
-    @Parameter(title: "Promemoria, minuti prima") var reminderMinutes: Int?
-    @Parameter(title: "Categoria") var category: String?
-    @Parameter(title: "Priorità da 0 a 3") var priority: Int?
-    @Parameter(title: "Numero occorrenze", default: 1) var count: Int
-    @Parameter(title: "Ogni quanti giorni", default: 7) var intervalDays: Int
-
-    static var parameterSummary: some ParameterSummary { Summary("Metti \(\.$name) da \(\.$start)") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        var template = AgendaIntentBridge.matchingTemplate(named: clean, in: store) ?? BlockTemplate(id: UUID(), name: clean, durationSlots: 4, colorHex: "#B8DFF5")
-        let startSlot = try AgendaTime.slot(start)
-        if let end {
-            let midnight = try AgendaTime.date(key: AgendaTime.key(start), slot: 64)
-            let endSlot: Int
-            if end == midnight { endSlot = 64 }
-            else {
-                guard AgendaTime.key(end) == AgendaTime.key(start) else { throw AgendaOperationError.invalid("La fine deve essere nello stesso giorno o a mezzanotte.") }
-                endSlot = try AgendaTime.slot(end)
-            }
-            template.durationSlots = endSlot - startSlot
-            if let durationMinutes, try AgendaTime.slots(durationMinutes) != template.durationSlots { throw AgendaOperationError.invalid("Fine e durata indicano intervalli diversi. Specifica uno dei due o valori coerenti.") }
-        } else if let durationMinutes { template.durationSlots = try AgendaTime.slots(durationMinutes) }
-        if let customName { template.name = customName.trimmingCharacters(in: .whitespacesAndNewlines) }
-        if let color { template.colorHex = color.hex }
-        if let location { template.location = location; template.latitude = nil; template.longitude = nil }
-        if latitude != nil || longitude != nil { template.latitude = latitude; template.longitude = longitude }
-        if let notes { template.notes = notes }
-        if let reminderMinutes { template.reminderMinutes = reminderMinutes }
-        if let category { template.category = category }
-        if let priority { template.priority = priority }
-        let item = AgendaEvent(id: UUID(), templateID: template.id, name: template.name, durationSlots: template.durationSlots, colorHex: template.colorHex, dateKey: AgendaTime.key(start), startSlot: startSlot, reminderMinutes: template.reminderMinutes, location: template.location, notes: template.notes, latitude: template.latitude, longitude: template.longitude, category: template.category, priority: template.priority)
-        try store.insertEvents(store.copies(of: item, firstStart: start, count: count, intervalDays: intervalDays))
-
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct CreateFromBlockAdvancedIntent: AppIntent {
-    static var title: LocalizedStringResource = "Crea impegno da blocco con opzioni"
-    static var description = IntentDescription("Crea impegno da blocco con opzioni. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Blocco") var block: AgendaBlockEntity
-    @Parameter(title: "Inizio", kind: .dateTime) var start: Date
-    @Parameter(title: "Nome personalizzato") var customName: String?
-    @Parameter(title: "Fine (alternativa alla durata)", kind: .dateTime) var end: Date?
-    @Parameter(title: "Durata esplicita in minuti") var durationMinutes: Int?
-    @Parameter(title: "Colore") var color: AgendaColorChoice?
-    @Parameter(title: "Luogo") var location: String?
-    @Parameter(title: "Latitudine") var latitude: Double?
-    @Parameter(title: "Longitudine") var longitude: Double?
-    @Parameter(title: "Note") var notes: String?
-    @Parameter(title: "Promemoria, minuti prima") var reminderMinutes: Int?
-    @Parameter(title: "Categoria") var category: String?
-    @Parameter(title: "Priorità da 0 a 3") var priority: Int?
-    @Parameter(title: "Numero occorrenze", default: 1) var count: Int
-    @Parameter(title: "Ogni quanti giorni", default: 7) var intervalDays: Int
-
-    static var parameterSummary: some ParameterSummary { Summary("Pianifica \(\.$block) da \(\.$start)") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        guard var template = store.template(id: block.id) else { throw AgendaOperationError.invalid("Blocco non trovato.") }
-        let startSlot = try AgendaTime.slot(start)
-        if let end {
-            let midnight = try AgendaTime.date(key: AgendaTime.key(start), slot: 64)
-            let endSlot: Int
-            if end == midnight { endSlot = 64 }
-            else {
-                guard AgendaTime.key(end) == AgendaTime.key(start) else { throw AgendaOperationError.invalid("La fine deve essere nello stesso giorno o a mezzanotte.") }
-                endSlot = try AgendaTime.slot(end)
-            }
-            template.durationSlots = endSlot - startSlot
-            if let durationMinutes, try AgendaTime.slots(durationMinutes) != template.durationSlots { throw AgendaOperationError.invalid("Fine e durata indicano intervalli diversi. Specifica uno dei due o valori coerenti.") }
-        } else if let durationMinutes { template.durationSlots = try AgendaTime.slots(durationMinutes) }
-        if let customName { template.name = customName.trimmingCharacters(in: .whitespacesAndNewlines) }
-        if let color { template.colorHex = color.hex }
-        if let location { template.location = location; template.latitude = nil; template.longitude = nil }
-        if latitude != nil || longitude != nil { template.latitude = latitude; template.longitude = longitude }
-        if let notes { template.notes = notes }
-        if let reminderMinutes { template.reminderMinutes = reminderMinutes }
-        if let category { template.category = category }
-        if let priority { template.priority = priority }
-        let item = AgendaEvent(id: UUID(), templateID: template.id, name: template.name, durationSlots: template.durationSlots, colorHex: template.colorHex, dateKey: AgendaTime.key(start), startSlot: startSlot, reminderMinutes: template.reminderMinutes, location: template.location, notes: template.notes, latitude: template.latitude, longitude: template.longitude, category: template.category, priority: template.priority)
-        try store.insertEvents(store.copies(of: item, firstStart: start, count: count, intervalDays: intervalDays))
-
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
-    }
-}
-
-struct ConfigureBlockDefaultsIntent: AppIntent {
-    static var title: LocalizedStringResource = "Configura opzioni del blocco"
-    static var description = IntentDescription("Configura opzioni del blocco. Gli orari seguono la griglia di 15 minuti; i conflitti vengono segnalati senza sovrascrivere altri impegni.")
-    @Parameter(title: "Blocco") var block: AgendaBlockEntity
-    @Parameter(title: "Luogo") var location: String?
-    @Parameter(title: "Latitudine") var latitude: Double?
-    @Parameter(title: "Longitudine") var longitude: Double?
-    @Parameter(title: "Note") var notes: String?
-    @Parameter(title: "Promemoria, minuti prima") var reminderMinutes: Int?
-    @Parameter(title: "Rimuovi promemoria", default: false) var removeReminder: Bool
-    @Parameter(title: "Categoria") var category: String?
-    @Parameter(title: "Priorità da 0 a 3") var priority: Int?
-    @Parameter(title: "Ripeti per quante settimane") var repeatWeeks: Int?
-
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        guard var template = store.template(id: block.id), store.cacheHealthy else { throw AgendaOperationError.invalid("Blocco non disponibile.") }
-        if let location { template.location = location; template.latitude = nil; template.longitude = nil }
-        if latitude != nil || longitude != nil { template.latitude = latitude; template.longitude = longitude }
-        if let notes { template.notes = notes }
-        if let category { template.category = category }
-        if let priority { template.priority = priority }
-        if let reminderMinutes { template.reminderMinutes = reminderMinutes }
-        if removeReminder { template.reminderMinutes = nil }
-        if let repeatWeeks {
-            guard (1...104).contains(repeatWeeks) else { throw AgendaOperationError.invalid("Indica da 1 a 104 settimane.") }
-            template.repeatWeeks = repeatWeeks > 1 ? repeatWeeks : nil
+        if value.contains("cosa ho") || value.contains("agenda di") || value.contains("agenda oggi") || value.contains("agenda domani") {
+            let date = AgendaIntentBridge.dayMentioned(in: request)
+            return AgendaIntentBridge.spokenResult(AgendaIntentBridge.daySummary(store, date: date))
         }
-        try AgendaTime.metadata(reminder: template.reminderMinutes, latitude: template.latitude, longitude: template.longitude, priority: template.priority)
-        store.updateTemplate(template)
 
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog("Fatto. Agenda aggiornata."))
+        if (value.contains("crea") || value.contains("nuovo")) && value.contains("blocco") {
+            guard let name = AgendaIntentBridge.guessedNewBlockName(in: request) else {
+                return AgendaIntentBridge.spokenResult("Dimmi anche il nome del blocco. Per esempio: crea un blocco preimpostato Palestra da un'ora e mezza.")
+            }
+            if AgendaIntentBridge.matchingTemplate(named: name, in: store) != nil {
+                return AgendaIntentBridge.spokenResult("Esiste già un blocco chiamato \(name).")
+            }
+            let minutes = AgendaIntentBridge.minutesMentioned(in: request) ?? 60
+            let duration = try AgendaIntentBridge.slots(minutes: minutes)
+            let color = AgendaIntentBridge.colorMentioned(in: request) ?? .azzurro
+            let reminder = AgendaIntentBridge.reminderMentioned(in: request)
+            let location = AgendaIntentBridge.locationMentioned(in: request)
+            let repeatWeeks = AgendaIntentBridge.repeatWeeksMentioned(in: request)
+            store.addTemplate(
+                name: name,
+                durationSlots: duration,
+                colorHex: color.hex,
+                repeatWeeks: repeatWeeks,
+                reminderMinutes: reminder,
+                location: location
+            )
+            await AgendaIntentBridge.finishMutation(store)
+            var details = "Fatto. Ho creato il blocco preimpostato \(name), durata \(AgendaIntentBridge.durationText(slots: duration))"
+            if let location { details += ", luogo \(location)" }
+            if let reminder { details += ", promemoria \(reminder) minuti prima" }
+            details += ". Non l'ho inserito nel calendario."
+            return AgendaIntentBridge.spokenResult(details)
+        }
+
+        if let template = AgendaIntentBridge.templateMentioned(in: request, store: store),
+           value.contains("metti") || value.contains("programma") || value.contains("pianifica") || value.contains("inserisci") {
+            let day = AgendaIntentBridge.dayMentioned(in: request)
+            guard let start = AgendaIntentBridge.hourMentioned(in: request, baseDate: day) else {
+                return AgendaIntentBridge.spokenResult("Ho riconosciuto il blocco \(template.name). Dimmi anche l'orario, per esempio: metti \(template.name) domani alle 18.")
+            }
+            let slot = try AgendaIntentBridge.slot(for: start)
+            if let error = store.addEvent(template: template, dateKey: AgendaIntentBridge.dateKey(start), startSlot: slot) {
+                return AgendaIntentBridge.spokenResult(error)
+            }
+            await AgendaIntentBridge.finishMutation(store)
+            return AgendaIntentBridge.spokenResult("Fatto. Ho messo \(template.name) \(AgendaIntentBridge.spokenDateTime(start)).")
+        }
+
+        if let existing = AgendaIntentBridge.eventMentioned(in: request, store: store) {
+            if value.contains("anticip") || value.contains("indietro") || value.contains("prima") {
+                let minutes = AgendaIntentBridge.minutesMentioned(in: request) ?? 15
+                let start = try AgendaIntentBridge.dateByShifting(existing, minutes: -minutes)
+                let slot = try AgendaIntentBridge.slot(for: start)
+                if let error = store.moveEvent(id: existing.id, toDateKey: AgendaIntentBridge.dateKey(start), startSlot: slot) { return AgendaIntentBridge.spokenResult(error) }
+                await AgendaIntentBridge.finishMutation(store)
+                return AgendaIntentBridge.spokenResult("Fatto. Ho anticipato \(existing.name) di \(minutes) minuti. Ora inizia alle \(AgendaIntentBridge.timeText(slot: slot)).")
+            }
+            if value.contains("posticip") || value.contains("avanti") || value.contains("dopo") || value.contains("sposta") {
+                let minutes = AgendaIntentBridge.minutesMentioned(in: request) ?? 15
+                let start = try AgendaIntentBridge.dateByShifting(existing, minutes: minutes)
+                let slot = try AgendaIntentBridge.slot(for: start)
+                if let error = store.moveEvent(id: existing.id, toDateKey: AgendaIntentBridge.dateKey(start), startSlot: slot) { return AgendaIntentBridge.spokenResult(error) }
+                await AgendaIntentBridge.finishMutation(store)
+                return AgendaIntentBridge.spokenResult("Fatto. Ho posticipato \(existing.name) di \(minutes) minuti. Ora inizia alle \(AgendaIntentBridge.timeText(slot: slot)).")
+            }
+            if value.contains("allunga") || value.contains("prolunga") {
+                let minutes = AgendaIntentBridge.minutesMentioned(in: request) ?? 15
+                var updated = existing
+                updated.durationSlots += try AgendaIntentBridge.slots(minutes: minutes)
+                if let error = store.updateEvent(updated) { return AgendaIntentBridge.spokenResult(error) }
+                await AgendaIntentBridge.finishMutation(store)
+                return AgendaIntentBridge.spokenResult("Fatto. Ho allungato \(updated.name) di \(minutes) minuti.")
+            }
+            if value.contains("accorcia") || value.contains("riduci") {
+                let minutes = AgendaIntentBridge.minutesMentioned(in: request) ?? 15
+                var updated = existing
+                let reduction = try AgendaIntentBridge.slots(minutes: minutes)
+                guard updated.durationSlots - reduction >= 1 else { return AgendaIntentBridge.spokenResult("La durata minima è 15 minuti.") }
+                updated.durationSlots -= reduction
+                if let error = store.updateEvent(updated) { return AgendaIntentBridge.spokenResult(error) }
+                await AgendaIntentBridge.finishMutation(store)
+                return AgendaIntentBridge.spokenResult("Fatto. Ho accorciato \(updated.name) di \(minutes) minuti.")
+            }
+            if value.contains("rimuovi") && (value.contains("promemoria") || value.contains("avviso")) {
+                var updated = existing
+                updated.reminderMinutes = nil
+                if let error = store.updateEvent(updated) { return AgendaIntentBridge.spokenResult(error) }
+                await AgendaIntentBridge.finishMutation(store)
+                return AgendaIntentBridge.spokenResult("Fatto. Ho rimosso il promemoria da \(updated.name).")
+            }
+            if value.contains("promemoria") || value.contains("ricord") || value.contains("avvis") {
+                let minutes = AgendaIntentBridge.reminderMentioned(in: request) ?? 15
+                var updated = existing
+                updated.reminderMinutes = minutes
+                if let error = store.updateEvent(updated) { return AgendaIntentBridge.spokenResult(error) }
+                await AgendaIntentBridge.finishMutation(store)
+                return AgendaIntentBridge.spokenResult("Fatto. Ho impostato il promemoria di \(updated.name) \(minutes) minuti prima.")
+            }
+            if value.contains("rimuovi") && value.contains("luogo") {
+                var updated = existing
+                updated.location = nil
+                if let error = store.updateEvent(updated) { return AgendaIntentBridge.spokenResult(error) }
+                await AgendaIntentBridge.finishMutation(store)
+                return AgendaIntentBridge.spokenResult("Fatto. Ho rimosso il luogo da \(updated.name).")
+            }
+            if value.contains("luogo"), let location = AgendaIntentBridge.locationMentioned(in: request) {
+                var updated = existing
+                updated.location = location
+                if let error = store.updateEvent(updated) { return AgendaIntentBridge.spokenResult(error) }
+                await AgendaIntentBridge.finishMutation(store)
+                return AgendaIntentBridge.spokenResult("Fatto. Il luogo di \(updated.name) è \(location).")
+            }
+        }
+
+        if value.contains("blocchi") || value.contains("blocchi preimpostati") {
+            let text = store.templates.isEmpty
+                ? "Non hai ancora blocchi preimpostati."
+                : "I tuoi blocchi sono: " + store.templates.map { "\($0.name), \(AgendaIntentBridge.durationText(slots: $0.durationSlots))" }.joined(separator: "; ") + "."
+            return AgendaIntentBridge.spokenResult(text)
+        }
+
+        return AgendaIntentBridge.spokenResult("Non ho capito con certezza. Puoi dirmi, per esempio: crea un blocco preimpostato Palestra da un'ora e mezza; metti Palestra domani alle 18; sposta Palestra avanti di mezz'ora; oppure cosa ho domani.")
     }
 }
 
-struct ItalianAgendaCommandIntent: AppIntent {
-    static var title: LocalizedStringResource = "Esegui comando agenda in italiano"
-    static var description = IntentDescription("Spostamenti, durate e creazione da una frase italiana. Esempio: metti Palestra domani alle 18 per un'ora con promemoria 15 minuti prima e luogo Eden Bibbiano. Per nomi ambigui usa l'azione con selezione dell'impegno.")
-    @Parameter(title: "Comando", requestValueDialog: "Quale comando vuoi eseguire? Puoi dire: sposta Palestra avanti di 15 minuti.") var command: String
-
-    static var parameterSummary: some ParameterSummary { Summary("Esegui \(\.$command)") }
-
-    @MainActor
-    func perform() async throws -> some IntentResult & ProvidesDialog {
-        let store = AgendaIntentBridge.makeStore()
-        let parsed = try AgendaVoiceCommand.parse(command)
-        let answer: String
-        switch parsed {
-        case .shift(let name, let minutes), .resize(let name, let minutes):
-            let matches = store.events.filter {
-                $0.name.compare(name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame &&
-                (AgendaIntentBridge.eventDate($0)?.addingTimeInterval(Double($0.durationSlots * 900)) ?? .distantPast) > Date()
-            }
-            guard matches.count == 1, var item = matches.first else {
-                throw AgendaOperationError.invalid(matches.isEmpty ? "Non trovo un impegno futuro chiamato \(name)." : "Ci sono più impegni chiamati \(name). Usa l'azione Sposta impegno o Allunga impegno e scegli la data: non ne ho modificato nessuno.")
-            }
-            switch parsed {
-            case .shift: item = try store.shifted(item, minutes: minutes)
-            default: item.durationSlots += try AgendaTime.slots(minutes, signed: true)
-            }
-            try store.commitEvent(item)
-            answer = "\(item.name): \(AgendaIntentBridge.entitySubtitle(dateKey: item.dateKey, startSlot: item.startSlot)), durata \(item.durationSlots * 15) minuti."
-        case .create(let name, let day, let hour, let minute, let duration, let reminder, let location):
-            let date: Date
-            if let offset = ["oggi": 0, "domani": 1, "dopodomani": 2][day] {
-                date = Calendar.current.date(byAdding: .day, value: offset, to: Calendar.current.startOfDay(for: Date()))!
-            } else { date = try AgendaTime.day(day) }
-            guard minute % 15 == 0 else { throw AgendaOperationError.invalid("L'orario deve essere sulla griglia di 15 minuti.") }
-            let start = try AgendaTime.date(key: AgendaTime.key(date), slot: hour * 4 + minute / 15 - 32)
-            let item = try AgendaIntentBridge.addCustomEvent(to: store, name: name, start: start, durationSlots: AgendaTime.slots(duration), repeatWeeks: 1, reminderMinutes: reminder, location: location)
-            answer = "Inserito \(item.name), \(AgendaIntentBridge.spokenDateTime(start)), per \(duration) minuti."
-        }
-        await AgendaIntentBridge.finishMutation(store)
-        return .result(dialog: AgendaIntentBridge.dialog(answer))
+struct AgendaAppShortcuts: AppShortcutsProvider {
+    static var appShortcuts: [AppShortcut] {
+        AppShortcut(
+            intent: CreateReusableBlockIntent(),
+            phrases: [
+                "Crea un blocco preimpostato in \(.applicationName)",
+                "Crea un blocco riutilizzabile in \(.applicationName)",
+                "Nuovo blocco preimpostato in \(.applicationName)"
+            ],
+            shortTitle: "Crea blocco preimpostato",
+            systemImageName: "square.stack.3d.up.badge.plus"
+        )
+        AppShortcut(
+            intent: AddReusableBlockToAgendaIntent(),
+            phrases: [
+                "Metti \(\.$block) in \(.applicationName)",
+                "Programma \(\.$block) con \(.applicationName)"
+            ],
+            shortTitle: "Programma blocco",
+            systemImageName: "calendar.badge.plus"
+        )
+        AppShortcut(
+            intent: AddAgendaEventIntent(),
+            phrases: [
+                "Aggiungi un impegno in \(.applicationName)",
+                "Crea un impegno con \(.applicationName)"
+            ],
+            shortTitle: "Nuovo impegno",
+            systemImageName: "plus.rectangle.on.rectangle"
+        )
+        AppShortcut(
+            intent: ShiftAgendaEventByMinutesIntent(),
+            phrases: [
+                "Sposta un impegno in \(.applicationName)",
+                "Anticipa o posticipa un impegno in \(.applicationName)"
+            ],
+            shortTitle: "Sposta di minuti",
+            systemImageName: "arrow.left.and.right"
+        )
+        AppShortcut(
+            intent: AgendaForDayIntent(),
+            phrases: [
+                "Cosa ho oggi in \(.applicationName)",
+                "Cosa ho domani in \(.applicationName)"
+            ],
+            shortTitle: "Agenda del giorno",
+            systemImageName: "calendar"
+        )
+        AppShortcut(
+            intent: NextAgendaEventIntent(),
+            phrases: ["Qual è il prossimo impegno in \(.applicationName)"],
+            shortTitle: "Prossimo impegno",
+            systemImageName: "clock.badge.questionmark"
+        )
+        AppShortcut(
+            intent: FindFreeTimeIntent(),
+            phrases: ["Trova tempo libero in \(.applicationName)"],
+            shortTitle: "Trova tempo libero",
+            systemImageName: "clock"
+        )
+        AppShortcut(
+            intent: AskAgendaIntent(),
+            phrases: [
+                "Parla con \(.applicationName)",
+                "Chiedi qualcosa a \(.applicationName)",
+                "Gestisci la mia agenda con \(.applicationName)"
+            ],
+            shortTitle: "Parla con l'agenda",
+            systemImageName: "waveform"
+        )
+        AppShortcut(
+            intent: ListReusableBlocksIntent(),
+            phrases: ["Quali blocchi ho in \(.applicationName)"],
+            shortTitle: "I miei blocchi",
+            systemImageName: "square.stack.3d.up"
+        )
+        AppShortcut(
+            intent: SyncAgendaIntent(),
+            phrases: ["Sincronizza \(.applicationName)"],
+            shortTitle: "Sincronizza",
+            systemImageName: "arrow.triangle.2.circlepath"
+        )
     }
+
+    static var shortcutTileColor: ShortcutTileColor { .blue }
 }

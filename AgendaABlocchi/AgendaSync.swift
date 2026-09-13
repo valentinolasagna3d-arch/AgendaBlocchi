@@ -523,7 +523,7 @@ struct AgendaSyncView: View {
                         Text(error).font(.footnote).foregroundStyle(.orange)
                             .textSelection(.enabled)
                     }
-                    Text("Agenda a Blocchi 5.5 Siri · iPhone e iPad")
+                    Text("Agenda a Blocchi 5.7 Siri Natural · iPhone e iPad")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if let account = store.signedInEmail {
