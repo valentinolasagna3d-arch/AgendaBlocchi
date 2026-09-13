@@ -1597,12 +1597,12 @@ struct AskAgendaIntent: AppIntent {
         let store = AgendaIntentBridge.makeStore()
         let value = AgendaIntentBridge.normalized(request)
 
-        if let aiAnswer = await AgendaAIInterpreter.execute(request, store: store) {
-            return .result(dialog: AgendaIntentBridge.dialog(aiAnswer))
-        }
-
         func answer(_ text: String) -> some IntentResult & ProvidesDialog {
             .result(dialog: AgendaIntentBridge.dialog(text))
+        }
+
+        if let aiAnswer = await AgendaAIInterpreter.execute(request, store: store) {
+            return answer(aiAnswer)
         }
 
         do {
