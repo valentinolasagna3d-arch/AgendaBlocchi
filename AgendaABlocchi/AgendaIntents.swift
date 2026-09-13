@@ -1583,9 +1583,10 @@ struct RemoveReusableBlockLocationIntent: AppIntent {
 
 struct AskAgendaIntent: AppIntent {
     static var title: LocalizedStringResource = "Parla con Agenda a Blocchi"
+    static var openAppWhenRun: Bool = false
     static var description = IntentDescription("Interpreta una richiesta in italiano e usa le funzioni di Agenda a Blocchi. Gli errori vengono sempre spiegati a voce invece di chiudere Siri con un errore generico.")
 
-    @Parameter(title: "Cosa vuoi fare") var request: String
+    @Parameter(title: "Cosa vuoi fare", requestValueDialog: IntentDialog("Cosa vuoi fare in Agenda a Blocchi?")) var request: String
 
     static var parameterSummary: some ParameterSummary {
         Summary("In Agenda a Blocchi: \(\.$request)")
@@ -1595,6 +1596,10 @@ struct AskAgendaIntent: AppIntent {
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let store = AgendaIntentBridge.makeStore()
         let value = AgendaIntentBridge.normalized(request)
+
+        if let aiAnswer = await AgendaAIInterpreter.execute(request, store: store) {
+            return .result(dialog: AgendaIntentBridge.dialog(aiAnswer))
+        }
 
         func answer(_ text: String) -> some IntentResult & ProvidesDialog {
             .result(dialog: AgendaIntentBridge.dialog(text))
@@ -2028,14 +2033,15 @@ struct AgendaAppShortcuts: AppShortcutsProvider {
             systemImageName: "clock"
         )
         AppShortcut(
-            intent: OpenAgendaAssistantIntent(),
+            intent: AskAgendaIntent(),
             phrases: [
-                "Apri assistente in \(.applicationName)",
-                "Avvia assistente di \(.applicationName)",
-                "Apri la voce di \(.applicationName)"
+                "Parla con \(.applicationName)",
+                "Usa \(.applicationName)",
+                "Chiedi a \(.applicationName)",
+                "Gestisci la mia agenda con \(.applicationName)"
             ],
-            shortTitle: "Assistente vocale",
-            systemImageName: "waveform.circle.fill"
+            shortTitle: "Parla con Agenda",
+            systemImageName: "apple.intelligence"
         )
         AppShortcut(
             intent: ListReusableBlocksIntent(),

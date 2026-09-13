@@ -2281,8 +2281,17 @@ final class AgendaVoiceAssistantModel: NSObject, ObservableObject {
         statusText = appleIntelligenceAvailable ? "Apple Intelligence sta capendo la richiesta…" : "Sto elaborando la richiesta…"
 
         var command = text
-        var result = await AgendaNaturalCommandEngine.execute(command, store: store)
+        var result: String
 
+        // Apple Intelligence is now the primary interpreter, not merely a fallback
+        // that rewrites the user's words for a rigid keyword parser.
+        if appleIntelligenceAvailable, let aiResult = await AgendaAIInterpreter.execute(text, store: store) {
+            result = aiResult
+        } else {
+            result = await AgendaNaturalCommandEngine.execute(command, store: store)
+        }
+
+        // Keep the old normalizer only as a final compatibility fallback.
         if result == "Non ho capito con certezza la richiesta.", appleIntelligenceAvailable {
             if let normalized = await normalizeWithAppleIntelligence(text), !normalized.isEmpty {
                 command = normalized
