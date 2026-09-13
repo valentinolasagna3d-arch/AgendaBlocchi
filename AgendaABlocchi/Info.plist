@@ -10,6 +10,8 @@
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key><string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>NSMicrophoneUsageDescription</key><string>Agenda a Blocchi usa il microfono solo quando avvii l'assistente vocale.</string>
+    <key>NSSpeechRecognitionUsageDescription</key><string>Agenda a Blocchi usa il riconoscimento vocale per trasformare le tue richieste in azioni sull'agenda.</string>
     <key>UILaunchScreen</key><dict/>
     <key>UISupportedInterfaceOrientations</key>
     <array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>

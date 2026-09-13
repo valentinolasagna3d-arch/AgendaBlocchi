@@ -1785,6 +1785,185 @@ struct AskAgendaIntent: AppIntent {
     }
 }
 
+
+
+// MARK: - In-app voice assistant bridge
+
+extension Notification.Name {
+    static let agendaOpenVoiceAssistant = Notification.Name("it.agendaablocchi.openVoiceAssistant")
+}
+
+@MainActor
+enum AgendaNaturalCommandEngine {
+    static func execute(_ request: String, store: AgendaStore) async -> String {
+        let value = AgendaIntentBridge.normalized(request)
+
+        do {
+            if value.contains("sincron") {
+                await store.synchronize()
+                AgendaIntentBridge.notifyMutation()
+                return store.syncError.map { "Sincronizzazione non completata: \($0)" } ?? store.syncStatus
+            }
+
+            if value.contains("prossimo impegno") || value.contains("prossimo evento") || value.contains("prossimo appuntamento") {
+                let now = Date()
+                let next = store.events.compactMap { event -> (AgendaEvent, Date)? in
+                    guard let date = AgendaIntentBridge.eventDate(event), date >= now else { return nil }
+                    return (event, date)
+                }.min { $0.1 < $1.1 }
+                return next.map { "Il prossimo impegno è \($0.0.name), \(AgendaIntentBridge.spokenDateTime($0.1))." } ?? "Non risultano impegni futuri."
+            }
+
+            if value.contains("cosa ho") || value.contains("agenda di") || value.contains("agenda oggi") || value.contains("agenda domani") || value.contains("impegni di") {
+                let date = AgendaIntentBridge.dayMentioned(in: request)
+                return AgendaIntentBridge.daySummary(store, date: date)
+            }
+
+            if (value.contains("crea") || value.contains("nuovo") || value.contains("aggiungi")) && value.contains("blocco") {
+                guard let name = AgendaIntentBridge.guessedNewBlockName(in: request) else {
+                    return "Dimmi anche il nome del blocco. Per esempio: crea un blocco Palestra da un'ora e mezza."
+                }
+                if AgendaIntentBridge.matchingTemplate(named: name, in: store) != nil {
+                    return "Esiste già un blocco chiamato \(name)."
+                }
+                let minutes = AgendaIntentBridge.durationMinutesMentioned(in: request) ?? 60
+                let duration = try AgendaIntentBridge.slots(minutes: minutes)
+                let color = AgendaIntentBridge.colorMentioned(in: request) ?? .azzurro
+                let reminder = AgendaIntentBridge.reminderMentioned(in: request)
+                let location = AgendaIntentBridge.locationMentioned(in: request)
+                let repeatWeeks = AgendaIntentBridge.repeatWeeksMentioned(in: request)
+                store.addTemplate(name: name, durationSlots: duration, colorHex: color.hex, repeatWeeks: repeatWeeks, reminderMinutes: reminder, location: location)
+                await AgendaIntentBridge.finishMutation(store)
+                var answer = "Fatto. Ho creato il blocco \(name), durata \(AgendaIntentBridge.durationText(slots: duration))"
+                if let location { answer += ", luogo \(location)" }
+                if let reminder { answer += ", promemoria \(reminder) minuti prima" }
+                answer += ". Non l'ho inserito nel calendario."
+                return answer
+            }
+
+            if let template = AgendaIntentBridge.templateMentioned(in: request, store: store),
+               value.contains("metti") || value.contains("programma") || value.contains("pianifica") || value.contains("inserisci") || value.contains("aggiungi") {
+                let day = AgendaIntentBridge.dayMentioned(in: request)
+                let times = AgendaIntentBridge.timeMentions(in: request, baseDate: day)
+                guard let start = times.first ?? AgendaIntentBridge.hourMentioned(in: request, baseDate: day) else {
+                    return "Ho riconosciuto il blocco \(template.name). Dimmi anche l'orario."
+                }
+                let slot = try AgendaIntentBridge.slot(for: start)
+                if let error = store.addEvent(template: template, dateKey: AgendaIntentBridge.dateKey(start), startSlot: slot) { return error }
+                await AgendaIntentBridge.finishMutation(store)
+                return "Fatto. Ho messo \(template.name) \(AgendaIntentBridge.spokenDateTime(start))."
+            }
+
+            let isCreateEventRequest = ["crea", "aggiungi", "programma", "pianifica", "inserisci", "metti"].contains(where: { value.contains($0) })
+                && (["evento", "impegno", "appuntamento"].contains(where: { value.contains($0) }) || AgendaIntentBridge.hourMentioned(in: request, baseDate: AgendaIntentBridge.dayMentioned(in: request)) != nil)
+            if isCreateEventRequest {
+                guard let name = AgendaIntentBridge.guessedNewEventName(in: request) ?? AgendaIntentBridge.guessedNewBlockName(in: request) else {
+                    return "Dimmi il nome dell'impegno. Per esempio: metti Palestra domani alle 18 per un'ora."
+                }
+                let day = AgendaIntentBridge.dayMentioned(in: request)
+                let times = AgendaIntentBridge.timeMentions(in: request, baseDate: day)
+                guard let start = times.first ?? AgendaIntentBridge.hourMentioned(in: request, baseDate: day) else {
+                    return "Ho capito che vuoi creare \(name), ma mi serve anche l'orario."
+                }
+                let durationSlots: Int
+                if times.count >= 2, times[1] > start {
+                    durationSlots = try AgendaIntentBridge.slots(from: start, to: times[1])
+                } else {
+                    durationSlots = try AgendaIntentBridge.slots(minutes: AgendaIntentBridge.durationMinutesMentioned(in: request) ?? 60)
+                }
+                let created = try AgendaIntentBridge.addCustomEvent(to: store, name: name, start: start, durationSlots: durationSlots, repeatWeeks: AgendaIntentBridge.repeatWeeksMentioned(in: request), reminderMinutes: AgendaIntentBridge.reminderMentioned(in: request), location: AgendaIntentBridge.locationMentioned(in: request))
+                await AgendaIntentBridge.finishMutation(store)
+                return "Fatto. Ho aggiunto \(created.name) \(AgendaIntentBridge.spokenDateTime(start)), durata \(AgendaIntentBridge.durationText(slots: durationSlots))."
+            }
+
+            if let existing = AgendaIntentBridge.eventMentioned(in: request, store: store) {
+                if value.contains("anticip") || value.contains("indietro") || value.contains("prima") {
+                    let minutes = AgendaIntentBridge.minutesMentioned(in: request) ?? 15
+                    let start = try AgendaIntentBridge.dateByShifting(existing, minutes: -minutes)
+                    let slot = try AgendaIntentBridge.slot(for: start)
+                    if let error = store.moveEvent(id: existing.id, toDateKey: AgendaIntentBridge.dateKey(start), startSlot: slot) { return error }
+                    await AgendaIntentBridge.finishMutation(store)
+                    return "Fatto. Ho anticipato \(existing.name) di \(minutes) minuti. Ora inizia alle \(AgendaIntentBridge.timeText(slot: slot))."
+                }
+                if value.contains("posticip") || value.contains("avanti") || value.contains("dopo") || value.contains("sposta") {
+                    let minutes = AgendaIntentBridge.minutesMentioned(in: request) ?? 15
+                    let start = try AgendaIntentBridge.dateByShifting(existing, minutes: minutes)
+                    let slot = try AgendaIntentBridge.slot(for: start)
+                    if let error = store.moveEvent(id: existing.id, toDateKey: AgendaIntentBridge.dateKey(start), startSlot: slot) { return error }
+                    await AgendaIntentBridge.finishMutation(store)
+                    return "Fatto. Ho posticipato \(existing.name) di \(minutes) minuti. Ora inizia alle \(AgendaIntentBridge.timeText(slot: slot))."
+                }
+                if value.contains("allunga") || value.contains("prolunga") {
+                    let minutes = AgendaIntentBridge.minutesMentioned(in: request) ?? 15
+                    var updated = existing
+                    updated.durationSlots += try AgendaIntentBridge.slots(minutes: minutes)
+                    if let error = store.updateEvent(updated) { return error }
+                    await AgendaIntentBridge.finishMutation(store)
+                    return "Fatto. Ho allungato \(updated.name) di \(minutes) minuti."
+                }
+                if value.contains("accorcia") || value.contains("riduci") {
+                    let minutes = AgendaIntentBridge.minutesMentioned(in: request) ?? 15
+                    var updated = existing
+                    let reduction = try AgendaIntentBridge.slots(minutes: minutes)
+                    guard updated.durationSlots - reduction >= 1 else { return "La durata minima è 15 minuti." }
+                    updated.durationSlots -= reduction
+                    if let error = store.updateEvent(updated) { return error }
+                    await AgendaIntentBridge.finishMutation(store)
+                    return "Fatto. Ho accorciato \(updated.name) di \(minutes) minuti."
+                }
+                if value.contains("rimuovi") && (value.contains("promemoria") || value.contains("avviso")) {
+                    var updated = existing; updated.reminderMinutes = nil
+                    if let error = store.updateEvent(updated) { return error }
+                    await AgendaIntentBridge.finishMutation(store)
+                    return "Fatto. Ho rimosso il promemoria da \(updated.name)."
+                }
+                if value.contains("promemoria") || value.contains("ricord") || value.contains("avvis") {
+                    let minutes = AgendaIntentBridge.reminderMentioned(in: request) ?? 15
+                    var updated = existing; updated.reminderMinutes = minutes
+                    if let error = store.updateEvent(updated) { return error }
+                    await AgendaIntentBridge.finishMutation(store)
+                    return "Fatto. Ho impostato il promemoria di \(updated.name) \(minutes) minuti prima."
+                }
+                if value.contains("rimuovi") && value.contains("luogo") {
+                    var updated = existing; updated.location = nil
+                    if let error = store.updateEvent(updated) { return error }
+                    await AgendaIntentBridge.finishMutation(store)
+                    return "Fatto. Ho rimosso il luogo da \(updated.name)."
+                }
+                if value.contains("luogo"), let location = AgendaIntentBridge.locationMentioned(in: request) {
+                    var updated = existing; updated.location = location
+                    if let error = store.updateEvent(updated) { return error }
+                    await AgendaIntentBridge.finishMutation(store)
+                    return "Fatto. Il luogo di \(updated.name) è \(location)."
+                }
+            }
+
+            if value.contains("blocchi") || value.contains("preimpostati") || value.contains("riutilizzabili") {
+                return store.templates.isEmpty ? "Non hai ancora blocchi preimpostati." : "I tuoi blocchi sono: " + store.templates.map { "\($0.name), \(AgendaIntentBridge.durationText(slots: $0.durationSlots))" }.joined(separator: "; ") + "."
+            }
+
+            return "Non ho capito con certezza la richiesta."
+        } catch let failure as AgendaIntentFailure {
+            return failure.localizedDescription
+        } catch {
+            return "Non sono riuscito a completare la richiesta, ma non ho modificato i tuoi dati."
+        }
+    }
+}
+
+struct OpenAgendaAssistantIntent: AppIntent {
+    static var title: LocalizedStringResource = "Apri assistente Agenda a Blocchi"
+    static var description = IntentDescription("Apre l'assistente vocale interno di Agenda a Blocchi. Non usa il Calendario Apple.")
+    static var openAppWhenRun: Bool = true
+
+    @MainActor
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        UserDefaults.standard.set(true, forKey: "agenda.voiceAssistant.pending")
+        NotificationCenter.default.post(name: .agendaOpenVoiceAssistant, object: nil)
+        return .result(dialog: AgendaIntentBridge.dialog("Apro l'assistente di Agenda a Blocchi."))
+    }
+}
+
 struct AgendaAppShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(
@@ -1849,14 +2028,14 @@ struct AgendaAppShortcuts: AppShortcutsProvider {
             systemImageName: "clock"
         )
         AppShortcut(
-            intent: AskAgendaIntent(),
+            intent: OpenAgendaAssistantIntent(),
             phrases: [
-                "Parla con \(.applicationName)",
-                "Chiedi qualcosa a \(.applicationName)",
-                "Gestisci la mia agenda con \(.applicationName)"
+                "Apri assistente in \(.applicationName)",
+                "Avvia assistente di \(.applicationName)",
+                "Apri la voce di \(.applicationName)"
             ],
-            shortTitle: "Parla con l'agenda",
-            systemImageName: "waveform"
+            shortTitle: "Assistente vocale",
+            systemImageName: "waveform.circle.fill"
         )
         AppShortcut(
             intent: ListReusableBlocksIntent(),

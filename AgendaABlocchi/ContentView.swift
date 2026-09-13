@@ -3,6 +3,11 @@ import UniformTypeIdentifiers
 import UIKit
 import Combine
 import AppIntents
+import Speech
+import AVFoundation
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -23,6 +28,8 @@ struct ContentView: View {
     @State private var showFullDay = false
     @State private var quickTimeEvent: AgendaEvent?
     @State private var showPhoneBlocks = false
+    @State private var showVoiceAssistant = false
+    @State private var voiceAssistantAutoStart = false
 
     private let calendar = Calendar.current
     private let headerHeight: CGFloat = 48
@@ -95,6 +102,17 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showSync) { AgendaSyncView(store: store) }
+        .sheet(isPresented: $showVoiceAssistant, onDismiss: { voiceAssistantAutoStart = false }) {
+            AgendaVoiceAssistantView(store: store, autoStart: voiceAssistantAutoStart)
+        }
+        .onAppear { consumeVoiceAssistantLaunch() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { consumeVoiceAssistantLaunch() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .agendaOpenVoiceAssistant)) { _ in
+            voiceAssistantAutoStart = true
+            showVoiceAssistant = true
+        }
         .onReceive(NotificationCenter.default.publisher(for: .agendaIntentDidModifyData)) { _ in
             // Siri/Comandi Rapidi may edit the same persistent agenda while this view is alive.
             // Reload the sync cache so the calendar reflects the change immediately.
@@ -181,6 +199,18 @@ struct ContentView: View {
         }
     }
 
+    private func consumeVoiceAssistantLaunch() {
+        guard UserDefaults.standard.bool(forKey: "agenda.voiceAssistant.pending") else { return }
+        UserDefaults.standard.set(false, forKey: "agenda.voiceAssistant.pending")
+        voiceAssistantAutoStart = true
+        showVoiceAssistant = true
+    }
+
+    private func openVoiceAssistant(autoStart: Bool = false) {
+        voiceAssistantAutoStart = autoStart
+        showVoiceAssistant = true
+    }
+
     private func syncTitle(_ title: String, font: Font) -> some View {
         Button { showSync = true } label: {
             Label {
@@ -214,6 +244,14 @@ struct ContentView: View {
                     }
                     .buttonStyle(.bordered)
                     .tint(.indigo)
+
+                    Button { openVoiceAssistant() } label: {
+                        Image(systemName: "waveform.circle.fill")
+                            .font(.title3)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.indigo)
+                    .accessibilityLabel("Assistente vocale Agenda a Blocchi")
 
                     Spacer()
 
@@ -266,6 +304,13 @@ struct ContentView: View {
             ZStack {
                 HStack {
                     syncTitle("Agenda a blocchi", font: .title3.bold())
+
+                    Button { openVoiceAssistant() } label: {
+                        Label("Assistente AI", systemImage: "waveform.circle.fill")
+                            .font(.subheadline.bold())
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.indigo)
 
                     Spacer()
 
@@ -2054,5 +2099,355 @@ struct EventEditorView: View {
         let hour = totalMinutes / 60
         let minute = totalMinutes % 60
         return String(format: "%02d:%02d", hour, minute)
+    }
+}
+
+
+// MARK: - Assistente vocale interno
+
+@MainActor
+final class AgendaVoiceAssistantModel: NSObject, ObservableObject {
+    @Published var transcript = ""
+    @Published var responseText = ""
+    @Published var statusText = "Pronto"
+    @Published var isListening = false
+    @Published var isProcessing = false
+    @Published var appleIntelligenceAvailable = false
+
+    private let store: AgendaStore
+    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "it_IT"))
+    private let audioEngine = AVAudioEngine()
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var silenceTask: Task<Void, Never>?
+    private let synthesizer = AVSpeechSynthesizer()
+    private var didAutoStart = false
+
+    init(store: AgendaStore) {
+        self.store = store
+        super.init()
+        recognizer?.delegate = self
+        refreshAIAvailability()
+    }
+
+    func refreshAIAvailability() {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, *) {
+            appleIntelligenceAvailable = SystemLanguageModel.default.isAvailable
+        } else {
+            appleIntelligenceAvailable = false
+        }
+        #else
+        appleIntelligenceAvailable = false
+        #endif
+    }
+
+    func autoStartIfNeeded(_ requested: Bool) {
+        guard requested, !didAutoStart else { return }
+        didAutoStart = true
+        Task {
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            startListening()
+        }
+    }
+
+    func toggleListening() {
+        isListening ? stopListeningAndSubmit() : startListening()
+    }
+
+    func startListening() {
+        guard !isProcessing else { return }
+        requestPermissionsAndStart()
+    }
+
+    private func requestPermissionsAndStart() {
+        SFSpeechRecognizer.requestAuthorization { [weak self] speechStatus in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard speechStatus == .authorized else {
+                    self.statusText = "Consenti il riconoscimento vocale nelle Impostazioni."
+                    return
+                }
+                AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                    DispatchQueue.main.async {
+                        if granted { self.beginRecording() }
+                        else { self.statusText = "Consenti l'accesso al microfono nelle Impostazioni." }
+                    }
+                }
+            }
+        }
+    }
+
+    private func beginRecording() {
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        silenceTask?.cancel()
+        transcript = ""
+        responseText = ""
+
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.record, mode: .measurement, options: [.duckOthers])
+            try session.setActive(true, options: .notifyOthersOnDeactivation)
+
+            let request = SFSpeechAudioBufferRecognitionRequest()
+            request.shouldReportPartialResults = true
+            if #available(iOS 13.0, *) {
+                request.requiresOnDeviceRecognition = recognizer?.supportsOnDeviceRecognition ?? false
+            }
+            recognitionRequest = request
+
+            guard let recognizer, recognizer.isAvailable else {
+                statusText = "Riconoscimento vocale non disponibile in questo momento."
+                return
+            }
+
+            let input = audioEngine.inputNode
+            input.removeTap(onBus: 0)
+            let format = input.outputFormat(forBus: 0)
+            input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+                request.append(buffer)
+            }
+
+            recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if let result {
+                        self.transcript = result.bestTranscription.formattedString
+                        self.scheduleSilenceSubmit()
+                        if result.isFinal { self.finishRecording(submit: true) }
+                    }
+                    if error != nil && self.isListening {
+                        self.finishRecording(submit: !self.transcript.isEmpty)
+                    }
+                }
+            }
+
+            audioEngine.prepare()
+            try audioEngine.start()
+            isListening = true
+            statusText = "Ti ascolto… parla normalmente"
+        } catch {
+            statusText = "Non riesco ad avviare il microfono."
+            finishRecording(submit: false)
+        }
+    }
+
+    private func scheduleSilenceSubmit() {
+        silenceTask?.cancel()
+        silenceTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_350_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.isListening, !self.transcript.isEmpty else { return }
+                self.finishRecording(submit: true)
+            }
+        }
+    }
+
+    func stopListeningAndSubmit() {
+        finishRecording(submit: !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    private func finishRecording(submit: Bool) {
+        silenceTask?.cancel()
+        silenceTask = nil
+        if audioEngine.isRunning { audioEngine.stop() }
+        audioEngine.inputNode.removeTap(onBus: 0)
+        recognitionRequest?.endAudio()
+        recognitionRequest = nil
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        isListening = false
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+
+        if submit {
+            let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return }
+            Task { await process(text) }
+        } else if statusText == "Ti ascolto… parla normalmente" {
+            statusText = "Pronto"
+        }
+    }
+
+    func submitTypedText() {
+        let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        Task { await process(text) }
+    }
+
+    private func process(_ text: String) async {
+        isProcessing = true
+        statusText = appleIntelligenceAvailable ? "Apple Intelligence sta capendo la richiesta…" : "Sto elaborando la richiesta…"
+
+        var command = text
+        var result = await AgendaNaturalCommandEngine.execute(command, store: store)
+
+        if result == "Non ho capito con certezza la richiesta.", appleIntelligenceAvailable {
+            if let normalized = await normalizeWithAppleIntelligence(text), !normalized.isEmpty {
+                command = normalized
+                result = await AgendaNaturalCommandEngine.execute(command, store: store)
+            }
+        }
+
+        responseText = result
+        statusText = "Pronto"
+        isProcessing = false
+        speak(result)
+    }
+
+    private func normalizeWithAppleIntelligence(_ text: String) async -> String? {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, *) {
+            let model = SystemLanguageModel.default
+            guard model.isAvailable else { return nil }
+            let blocks = store.templates.map(\.name).joined(separator: ", ")
+            let futureEvents = store.events
+                .sorted(by: AgendaIntentBridge.eventSort)
+                .prefix(20)
+                .map { "\($0.name) \($0.dateKey) \(AgendaIntentBridge.timeText(slot: $0.startSlot))" }
+                .joined(separator: "; ")
+            let session = LanguageModelSession(instructions: """
+                Sei l'interprete vocale di un'app italiana chiamata Agenda a Blocchi. Trasforma la richiesta dell'utente in UNA sola frase italiana canonica, senza spiegazioni, pronta per essere eseguita dall'app. Non usare né citare il Calendario Apple. Mantieni esattamente nomi, date, orari, durate, luoghi e promemoria. Le azioni ammesse sono: crea blocco preimpostato, programma blocco, crea impegno, sposta/anticipa/posticipa impegno, allunga/accorcia impegno, imposta/rimuovi promemoria, imposta/rimuovi luogo, leggi agenda, prossimo impegno, elenca blocchi, sincronizza. Se manca un dato essenziale, conserva la richiesta senza inventarlo.
+                """)
+            do {
+                let prompt = """
+                    Oggi è \(Date().formatted(date: .complete, time: .shortened)).
+                    Blocchi conosciuti: \(blocks.isEmpty ? "nessuno" : blocks).
+                    Impegni conosciuti: \(futureEvents.isEmpty ? "nessuno" : futureEvents).
+                    Richiesta: \(text)
+                """
+                let response = try await session.respond(to: prompt)
+                return response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            } catch {
+                return nil
+            }
+        }
+        #endif
+        return nil
+    }
+
+    private func speak(_ text: String) {
+        synthesizer.stopSpeaking(at: .immediate)
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(language: "it-IT")
+        utterance.rate = 0.48
+        synthesizer.speak(utterance)
+    }
+}
+
+extension AgendaVoiceAssistantModel: SFSpeechRecognizerDelegate {
+    nonisolated func speechRecognizer(_ speechRecognizer: SFSpeechRecognizer, availabilityDidChange available: Bool) {
+        Task { @MainActor [weak self] in
+            if !available { self?.statusText = "Riconoscimento vocale temporaneamente non disponibile." }
+        }
+    }
+}
+
+struct AgendaVoiceAssistantView: View {
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var model: AgendaVoiceAssistantModel
+    private let autoStart: Bool
+
+    init(store: AgendaStore, autoStart: Bool) {
+        self.autoStart = autoStart
+        _model = StateObject(wrappedValue: AgendaVoiceAssistantModel(store: store))
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 18) {
+                HStack(spacing: 10) {
+                    Image(systemName: model.appleIntelligenceAvailable ? "apple.intelligence" : "waveform")
+                        .font(.title2)
+                        .foregroundStyle(.indigo)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Assistente Agenda a Blocchi")
+                            .font(.headline)
+                        Text(model.appleIntelligenceAvailable ? "Apple Intelligence sul dispositivo" : "Comandi vocali locali")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Puoi dire")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                    Text("“Crea un blocco Palestra verde da un'ora e mezza”\n“Metti Palestra domani alle 18”\n“Sposta Palestra avanti di mezz'ora”\n“Cosa ho domani?”")
+                        .font(.subheadline)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+
+                TextEditor(text: $model.transcript)
+                    .frame(minHeight: 110, maxHeight: 180)
+                    .padding(8)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(alignment: .topLeading) {
+                        if model.transcript.isEmpty {
+                            Text("Parla oppure scrivi qui la richiesta…")
+                                .foregroundStyle(.tertiary)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 16)
+                                .allowsHitTesting(false)
+                        }
+                    }
+
+                if !model.responseText.isEmpty {
+                    Text(model.responseText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                        .background(Color.indigo.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
+                }
+
+                if model.isProcessing {
+                    ProgressView(model.statusText)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                } else {
+                    Text(model.statusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 14) {
+                    Button {
+                        model.toggleListening()
+                    } label: {
+                        Label(model.isListening ? "Ferma" : "Parla", systemImage: model.isListening ? "stop.circle.fill" : "mic.circle.fill")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(model.isListening ? .red : .indigo)
+                    .disabled(model.isProcessing)
+
+                    Button {
+                        model.submitTypedText()
+                    } label: {
+                        Label("Invia", systemImage: "arrow.up.circle.fill")
+                            .font(.headline)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.isListening || model.isProcessing)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding()
+            .navigationTitle("Parla con l'agenda")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Fine") { dismiss() }
+                }
+            }
+            .onAppear {
+                model.refreshAIAvailability()
+                model.autoStartIfNeeded(autoStart)
+            }
+        }
     }
 }
