@@ -2,10 +2,8 @@ import Foundation
 import AppIntents
 
 // Calendar App Schema integration for the iOS/iPadOS 27 Siri stack.
-// IMPORTANT: the Calendar domain shipped after the Xcode 27 beta 6 SDK currently
-// installed on GitHub's `xcode-27` hosted runner. The whole implementation is
-// therefore guarded by CALENDAR_SCHEMA_BETA. The beta workflow enables that flag
-// only after a compiler probe confirms `.calendar` exists in the active SDK.
+// The normal build keeps its iOS 17 deployment target. The dedicated Xcode 27
+// workflow always enables CALENDAR_SCHEMA_BETA and builds the Calendar schema.
 #if CALENDAR_SCHEMA_BETA
 
 @available(iOS 27.0, *)
@@ -42,13 +40,11 @@ enum AgendaCalendarAttendeeStatus: String {
     case accepted
     case declined
     case tentative
-    case pending
 
     static let caseDisplayRepresentations: [Self: DisplayRepresentation] = [
         .accepted: "Accettato",
         .declined: "Rifiutato",
-        .tentative: "Forse",
-        .pending: "In attesa"
+        .tentative: "Forse"
     ]
 }
 
@@ -97,13 +93,19 @@ struct AgendaCalendarEntity {
     let id: UUID
     var title: String
 
+    // As in Apple's CometCal sample, assign through the schema-generated
+    // properties in an explicit initializer, not the wrapper memberwise init.
+    init(id: UUID, title: String) {
+        self.id = id
+        self.title = title
+    }
+
     var displayRepresentation: DisplayRepresentation {
         DisplayRepresentation(title: "\(title)", image: .init(systemName: "calendar"))
     }
 }
 
 @available(iOS 27.0, *)
-@MainActor
 struct AgendaCalendarEntityQuery: EntityStringQuery, EnumerableEntityQuery {
     typealias Entity = AgendaCalendarEntity
 
@@ -147,6 +149,15 @@ struct AgendaCalendarAttendeeEntity {
     var isAttendanceOptional: Bool
     var type: AgendaCalendarAttendeeType?
 
+    init(id: UUID, person: IntentPerson, status: AgendaCalendarAttendeeStatus?,
+         isAttendanceOptional: Bool, type: AgendaCalendarAttendeeType?) {
+        self.id = id
+        self.person = person
+        self.status = status
+        self.isAttendanceOptional = isAttendanceOptional
+        self.type = type
+    }
+
     var displayRepresentation: DisplayRepresentation {
         DisplayRepresentation(title: "Partecipante")
     }
@@ -184,6 +195,40 @@ struct AgendaCalendarEventEntity {
     var organizers: [IntentPerson]
     var attendees: [AgendaCalendarAttendeeEntity]
 
+    init(
+        id: UUID,
+        calendar: AgendaCalendarEntity,
+        title: String,
+        startDate: Date,
+        endDate: Date,
+        isAllDay: Bool,
+        recurrence: Calendar.RecurrenceRule?,
+        note: AttributedString?,
+        travelTime: Duration?,
+        location: AgendaCalendarEventLocation?,
+        virtualLocation: URL?,
+        status: AgendaCalendarEventStatus?,
+        alarms: [AgendaCalendarEventAlarm],
+        organizers: [IntentPerson],
+        attendees: [AgendaCalendarAttendeeEntity]
+    ) {
+        self.id = id
+        self.calendar = calendar
+        self.title = title
+        self.startDate = startDate
+        self.endDate = endDate
+        self.isAllDay = isAllDay
+        self.recurrence = recurrence
+        self.note = note
+        self.travelTime = travelTime
+        self.location = location
+        self.virtualLocation = virtualLocation
+        self.status = status
+        self.alarms = alarms
+        self.organizers = organizers
+        self.attendees = attendees
+    }
+
     var displayRepresentation: DisplayRepresentation {
         DisplayRepresentation(
             title: "\(title)",
@@ -197,6 +242,10 @@ struct AgendaCalendarEventEntity {
 @MainActor
 struct AgendaCalendarEventQuery: EntityStringQuery, EnumerableEntityQuery {
     typealias Entity = AgendaCalendarEventEntity
+
+    // EntityQuery.init() and AppEntity.defaultQuery are nonisolated.
+    // Construction is stateless; only the query methods access the main-actor store.
+    nonisolated init() {}
 
     func entities(for identifiers: [AgendaCalendarEventEntity.ID]) async throws -> [AgendaCalendarEventEntity] {
         let ids = Set(identifiers)
@@ -255,10 +304,12 @@ enum AgendaCalendarSchemaBridge {
             recurrence: nil,
             note: nil,
             travelTime: nil,
-            location: event.location.map { .text($0) },
+            location: event.location.map { AgendaCalendarEventLocation.text($0) },
             virtualLocation: nil,
             status: .confirmed,
-            alarms: [],
+            alarms: event.reminderMinutes.map { minutes in
+                [AgendaCalendarEventAlarm.date(start.addingTimeInterval(-Double(minutes) * 60))]
+            } ?? [],
             organizers: [],
             attendees: []
         )
