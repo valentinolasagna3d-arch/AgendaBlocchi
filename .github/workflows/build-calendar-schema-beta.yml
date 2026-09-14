@@ -9,12 +9,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show Xcode / SDK
+      - name: Verify Xcode 27 / iOS 27 SDK
         run: |
           set -euo pipefail
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
           swift --version
+          XCODE_VERSION="$(xcodebuild -version | awk '/^Xcode / {print $2}')"
+          SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+          if [[ "$XCODE_VERSION" != 27.* || "$SDK_VERSION" != 27.* ]]; then
+            echo "::error::La beta richiede Xcode 27 e iOS SDK 27. Selezionare Xcode 27 sul runner xcode-27."
+            exit 1
+          fi
 
       - name: Probe Calendar App Schema support
         shell: bash
@@ -31,15 +37,22 @@ jobs:
               var title: String
               var displayRepresentation: DisplayRepresentation { "Probe" }
 
+              init(id: String, title: String) {
+                  self.id = id
+                  self.title = title
+              }
+
               struct Query: EntityQuery {
-                  func entities(for identifiers: [CalendarSchemaProbeEntity.ID]) async throws -> [CalendarSchemaProbeEntity] { [] }
+                  func entities(for identifiers: [CalendarSchemaProbeEntity.ID]) async throws -> [CalendarSchemaProbeEntity] {
+                      identifiers.map { CalendarSchemaProbeEntity(id: $0, title: "Probe") }
+                  }
               }
           }
           SWIFT
 
           if ! xcrun --sdk iphoneos swiftc -typecheck -target arm64-apple-ios27.0 /tmp/CalendarSchemaProbe.swift >/tmp/calendar-schema-probe.log 2>&1; then
             cat /tmp/calendar-schema-probe.log
-            echo "::error::Il runner GitHub xcode-27 non espone ancora il Calendar App Schema richiesto. Al 14/09/2026 il runner pubblico usa Xcode 27 beta 6; Apple ha gia' rilasciato Xcode 27 RC. Riprova questo workflow quando GitHub aggiorna l'immagine xcode-27 alla RC o successiva."
+            echo "::error::Il probe Calendar Schema non compila con l'SDK selezionato. Consultare gli errori Swift sopra. La beta resta obbligatoria: nessun fallback alla build normale."
             exit 1
           fi
 
@@ -60,13 +73,13 @@ jobs:
           set -euo pipefail
           APP="$PWD/build-calendar-beta/Build/Products/Release-iphoneos/AgendaABlocchi.app"
           test -f "$APP/Info.plist"
-          rm -rf Payload AgendaABlocchi_v6_1_1_CalendarSchemaBeta_unsigned.ipa
+          rm -rf Payload AgendaABlocchi_v6_1_2_CalendarSchemaBeta_unsigned.ipa
           mkdir Payload
           cp -R "$APP" Payload/
-          /usr/bin/zip -qry AgendaABlocchi_v6_1_1_CalendarSchemaBeta_unsigned.ipa Payload
+          /usr/bin/zip -qry AgendaABlocchi_v6_1_2_CalendarSchemaBeta_unsigned.ipa Payload
 
       - name: Upload Calendar Schema Beta IPA
         uses: actions/upload-artifact@v4
         with:
-          name: AgendaABlocchi-v6.1.1-CalendarSchemaBeta-build65-IPA
-          path: AgendaABlocchi_v6_1_1_CalendarSchemaBeta_unsigned.ipa
+          name: AgendaABlocchi-v6.1.2-CalendarSchemaBeta-build66-IPA
+          path: AgendaABlocchi_v6_1_2_CalendarSchemaBeta_unsigned.ipa

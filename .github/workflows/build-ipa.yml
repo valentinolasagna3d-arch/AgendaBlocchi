@@ -33,13 +33,13 @@ jobs:
           set -euo pipefail
           APP="$PWD/build/Build/Products/Release-iphoneos/AgendaABlocchi.app"
           test -f "$APP/Info.plist"
-          rm -rf Payload AgendaABlocchi_v6_1_1_unsigned.ipa
+          rm -rf Payload AgendaABlocchi_v6_1_2_unsigned.ipa
           mkdir Payload
           cp -R "$APP" Payload/
-          /usr/bin/zip -qry AgendaABlocchi_v6_1_1_unsigned.ipa Payload
+          /usr/bin/zip -qry AgendaABlocchi_v6_1_2_unsigned.ipa Payload
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: AgendaABlocchi-v6.1.1-build65-IPA
-          path: AgendaABlocchi_v6_1_1_unsigned.ipa
+          name: AgendaABlocchi-v6.1.2-build66-IPA
+          path: AgendaABlocchi_v6_1_2_unsigned.ipa
