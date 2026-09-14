@@ -1,45 +1,45 @@
 name: Build Agenda IPA
-
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: xcode-27
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show Xcode version
-        run: xcodebuild -version
+      - name: Show Xcode / SDK
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          swift --version
+
+      - name: Validate Swift and sync regression tests
+        run: |
+          set -euo pipefail
+          xcrun swiftc -frontend -parse AgendaABlocchi/*.swift
+          xcrun swiftc -target "$(uname -m)-apple-macosx14.0" -swift-version 5 -D SYNC_TESTING -parse-as-library AgendaABlocchi/Models.swift AgendaABlocchi/AgendaSync.swift Tests/SyncRegression.swift -o /tmp/agenda-sync-tests
+          /tmp/agenda-sync-tests
 
       - name: Build unsigned iOS app
         run: |
           set -euo pipefail
-          xcodebuild \
-            -project AgendaABlocchi.xcodeproj \
-            -scheme AgendaABlocchi \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$PWD/build" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            build
+          xcodebuild -project AgendaABlocchi.xcodeproj -scheme AgendaABlocchi -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$PWD/build" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
 
-      - name: Package IPA
+      - name: Package SideStore IPA
         run: |
           set -euo pipefail
-          APP_PATH="$PWD/build/Build/Products/Release-iphoneos/AgendaABlocchi.app"
-          test -d "$APP_PATH"
-          mkdir -p Payload
-          cp -R "$APP_PATH" Payload/
-          /usr/bin/zip -qry AgendaABlocchi_v5_1_unsigned.ipa Payload
+          APP="$PWD/build/Build/Products/Release-iphoneos/AgendaABlocchi.app"
+          test -f "$APP/Info.plist"
+          rm -rf Payload AgendaABlocchi_v6_1_1_unsigned.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          /usr/bin/zip -qry AgendaABlocchi_v6_1_1_unsigned.ipa Payload
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: AgendaABlocchi-v5.1-IPA
-          path: AgendaABlocchi_v5_1_unsigned.ipa
-          if-no-files-found: error
+          name: AgendaABlocchi-v6.1.1-build65-IPA
+          path: AgendaABlocchi_v6_1_1_unsigned.ipa
