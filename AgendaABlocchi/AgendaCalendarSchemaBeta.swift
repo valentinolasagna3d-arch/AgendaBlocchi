@@ -1,12 +1,12 @@
 import Foundation
 import AppIntents
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
 
-// Experimental Calendar App Schema integration for the iOS/iPadOS 27 Siri stack.
-// The rest of Agenda a Blocchi still works on older systems; these types become
-// active only on systems that support the new Calendar App Schema APIs.
+// Calendar App Schema integration for the iOS/iPadOS 27 Siri stack.
+// IMPORTANT: the Calendar domain shipped after the Xcode 27 beta 6 SDK currently
+// installed on GitHub's `xcode-27` hosted runner. The whole implementation is
+// therefore guarded by CALENDAR_SCHEMA_BETA. The beta workflow enables that flag
+// only after a compiler probe confirms `.calendar` exists in the active SDK.
+#if CALENDAR_SCHEMA_BETA
 
 @available(iOS 27.0, *)
 @AppEnum(schema: .calendar.eventStatus)
@@ -42,11 +42,13 @@ enum AgendaCalendarAttendeeStatus: String {
     case accepted
     case declined
     case tentative
+    case pending
 
     static let caseDisplayRepresentations: [Self: DisplayRepresentation] = [
         .accepted: "Accettato",
         .declined: "Rifiutato",
-        .tentative: "Forse"
+        .tentative: "Forse",
+        .pending: "In attesa"
     ]
 }
 
@@ -60,10 +62,18 @@ enum AgendaCalendarAttendeeType: String {
     ]
 }
 
+// The Calendar schema accepts union values for locations and alarms. Keeping
+// these app-owned unions small lets Agenda a Blocchi map its current text-only
+// location/reminder model without changing persisted data.
 @available(iOS 27.0, *)
 @UnionValue
 enum AgendaCalendarEventLocation {
     case text(String)
+
+    static var typeDisplayRepresentation: TypeDisplayRepresentation { "Luogo evento" }
+    static let caseDisplayRepresentations: [Cases: DisplayRepresentation] = [
+        .text: "Luogo"
+    ]
 }
 
 @available(iOS 27.0, *)
@@ -71,6 +81,12 @@ enum AgendaCalendarEventLocation {
 enum AgendaCalendarEventAlarm {
     case duration(Duration)
     case date(Date)
+
+    static var typeDisplayRepresentation: TypeDisplayRepresentation { "Promemoria evento" }
+    static let caseDisplayRepresentations: [Cases: DisplayRepresentation] = [
+        .duration: "Prima dell'evento",
+        .date: "Data e ora"
+    ]
 }
 
 @available(iOS 27.0, *)
@@ -87,7 +103,10 @@ struct AgendaCalendarEntity {
 }
 
 @available(iOS 27.0, *)
+@MainActor
 struct AgendaCalendarEntityQuery: EntityStringQuery, EnumerableEntityQuery {
+    typealias Entity = AgendaCalendarEntity
+
     private static let agendaID = UUID(uuidString: "61A6DAD7-26AD-4A7F-B10C-AB10C0000001")!
 
     func entities(for identifiers: [AgendaCalendarEntity.ID]) async throws -> [AgendaCalendarEntity] {
@@ -135,16 +154,18 @@ struct AgendaCalendarAttendeeEntity {
 
 @available(iOS 27.0, *)
 struct AgendaCalendarAttendeeQuery: EntityQuery {
+    typealias Entity = AgendaCalendarAttendeeEntity
+
     func entities(for identifiers: [AgendaCalendarAttendeeEntity.ID]) async throws -> [AgendaCalendarAttendeeEntity] {
-        // Agenda a Blocchi currently doesn't persist attendees. The schema type is
-        // present so Siri can understand the standard Calendar action signature.
+        // Agenda a Blocchi does not persist attendees yet. The schema type is
+        // present because Calendar create/update intents require it.
         []
     }
 }
 
 @available(iOS 27.0, *)
 @AppEntity(schema: .calendar.event)
-struct AgendaCalendarEventEntity: SyncableEntity, OwnershipProvidingEntity {
+struct AgendaCalendarEventEntity {
     static let defaultQuery = AgendaCalendarEventQuery()
 
     let id: UUID
@@ -163,8 +184,6 @@ struct AgendaCalendarEventEntity: SyncableEntity, OwnershipProvidingEntity {
     var organizers: [IntentPerson]
     var attendees: [AgendaCalendarAttendeeEntity]
 
-    var ownership: EntityOwnership { .unknown }
-
     var displayRepresentation: DisplayRepresentation {
         DisplayRepresentation(
             title: "\(title)",
@@ -175,8 +194,10 @@ struct AgendaCalendarEventEntity: SyncableEntity, OwnershipProvidingEntity {
 }
 
 @available(iOS 27.0, *)
+@MainActor
 struct AgendaCalendarEventQuery: EntityStringQuery, EnumerableEntityQuery {
-    @MainActor
+    typealias Entity = AgendaCalendarEventEntity
+
     func entities(for identifiers: [AgendaCalendarEventEntity.ID]) async throws -> [AgendaCalendarEventEntity] {
         let ids = Set(identifiers)
         return AgendaStore().events
@@ -184,7 +205,6 @@ struct AgendaCalendarEventQuery: EntityStringQuery, EnumerableEntityQuery {
             .compactMap(AgendaCalendarSchemaBridge.entity)
     }
 
-    @MainActor
     func entities(matching string: String) async throws -> [AgendaCalendarEventEntity] {
         let value = string.trimmingCharacters(in: .whitespacesAndNewlines)
         return AgendaStore().events
@@ -194,7 +214,6 @@ struct AgendaCalendarEventQuery: EntityStringQuery, EnumerableEntityQuery {
             .compactMap(AgendaCalendarSchemaBridge.entity)
     }
 
-    @MainActor
     func suggestedEntities() async throws -> [AgendaCalendarEventEntity] {
         let cutoff = Calendar.current.date(byAdding: .day, value: -1, to: Date()) ?? .distantPast
         return AgendaStore().events
@@ -204,7 +223,6 @@ struct AgendaCalendarEventQuery: EntityStringQuery, EnumerableEntityQuery {
             .compactMap(AgendaCalendarSchemaBridge.entity)
     }
 
-    @MainActor
     func allEntities() async throws -> [AgendaCalendarEventEntity] {
         AgendaStore().events
             .sorted(by: AgendaIntentBridge.eventSort)
@@ -227,10 +245,9 @@ enum AgendaCalendarSchemaBridge {
     static func entity(_ event: AgendaEvent) -> AgendaCalendarEventEntity? {
         guard let start = AgendaIntentBridge.eventDate(event) else { return nil }
         let end = start.addingTimeInterval(TimeInterval(event.durationSlots * 15 * 60))
-        let calendar = AgendaCalendarEntityQuery.defaultEntity
         return AgendaCalendarEventEntity(
             id: event.id,
-            calendar: calendar,
+            calendar: AgendaCalendarEntityQuery.defaultEntity,
             title: event.name,
             startDate: start,
             endDate: end,
@@ -313,13 +330,17 @@ enum AgendaCalendarSchemaBridge {
             throw AgendaIntentFailure.message(error)
         }
         await AgendaIntentBridge.finishMutation(store)
-        guard let entity = entity(updated) else {
+        guard let result = entity(updated) else {
             throw AgendaIntentFailure.message("Ho aggiornato l'impegno, ma non riesco a restituirlo a Siri.")
         }
-        return entity
+        return result
     }
 
-    static func delete(in store: AgendaStore, entity: AgendaCalendarEventEntity, span: AgendaCalendarEventSpan?) async throws {
+    static func delete(
+        in store: AgendaStore,
+        entity: AgendaCalendarEventEntity,
+        span: AgendaCalendarEventSpan?
+    ) async throws {
         let current = try event(id: entity.id, in: store)
         if let seriesID = current.seriesID, span == .all || span == .future {
             let currentDate = AgendaIntentBridge.eventDate(current) ?? .distantPast
@@ -334,20 +355,6 @@ enum AgendaCalendarSchemaBridge {
         }
         await AgendaIntentBridge.finishMutation(store)
     }
-
-    #if canImport(CoreSpotlight)
-    static func donateCurrentState() async {
-        let store = AgendaStore()
-        let entities = store.events.compactMap(entity)
-        guard !entities.isEmpty else { return }
-        do {
-            try await CSSearchableIndex(name: "it.agendaablocchi.calendar-beta").indexAppEntities(entities)
-        } catch {
-            // Indexing is an optimization for Siri semantic resolution. Never make
-            // normal agenda usage fail if Spotlight rejects the beta entities.
-        }
-    }
-    #endif
 }
 
 @available(iOS 27.0, *)
@@ -366,14 +373,14 @@ struct AgendaCalendarCreateEventIntent {
     @MainActor
     func perform() async throws -> some ReturnsValue<AgendaCalendarEventEntity> {
         let store = AgendaIntentBridge.makeStore()
-        let entity = try await AgendaCalendarSchemaBridge.create(
+        let result = try await AgendaCalendarSchemaBridge.create(
             in: store,
             title: title,
             startDate: startDate,
             endDate: endDate,
             location: location
         )
-        return .result(value: entity)
+        return .result(value: result)
     }
 }
 
@@ -395,7 +402,7 @@ struct AgendaCalendarUpdateEventIntent {
     @MainActor
     func perform() async throws -> some ReturnsValue<AgendaCalendarEventEntity> {
         let store = AgendaIntentBridge.makeStore()
-        let entity = try await AgendaCalendarSchemaBridge.update(
+        let result = try await AgendaCalendarSchemaBridge.update(
             in: store,
             originalID: event.id,
             title: title,
@@ -403,7 +410,7 @@ struct AgendaCalendarUpdateEventIntent {
             endDate: endDate,
             location: location
         )
-        return .result(value: entity)
+        return .result(value: result)
     }
 }
 
@@ -420,3 +427,5 @@ struct AgendaCalendarDeleteEventIntent {
         return .result()
     }
 }
+
+#endif
