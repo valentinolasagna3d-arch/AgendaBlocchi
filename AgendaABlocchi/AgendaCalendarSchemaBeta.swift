@@ -140,37 +140,26 @@ struct AgendaCalendarEntityQuery: EntityStringQuery, EnumerableEntityQuery {
 
 @available(iOS 27.0, *)
 @AppEntity(schema: .calendar.attendee)
-struct AgendaCalendarAttendeeEntity {
-    static let defaultQuery = AgendaCalendarAttendeeQuery()
-
-    let id: UUID
+struct AgendaCalendarAttendeeEntity: TransientAppEntity {
+    // Attendees are values carried by an event, not independently stored records.
+    // Match Apple's CometCal model so schema intents can resolve these parameters.
     var person: IntentPerson
     var status: AgendaCalendarAttendeeStatus?
     var isAttendanceOptional: Bool
     var type: AgendaCalendarAttendeeType?
 
-    init(id: UUID, person: IntentPerson, status: AgendaCalendarAttendeeStatus?,
+    init(person: IntentPerson, status: AgendaCalendarAttendeeStatus?,
          isAttendanceOptional: Bool, type: AgendaCalendarAttendeeType?) {
-        self.id = id
         self.person = person
         self.status = status
         self.isAttendanceOptional = isAttendanceOptional
         self.type = type
     }
 
+    init() {}
+
     var displayRepresentation: DisplayRepresentation {
         DisplayRepresentation(title: "Partecipante")
-    }
-}
-
-@available(iOS 27.0, *)
-struct AgendaCalendarAttendeeQuery: EntityQuery {
-    typealias Entity = AgendaCalendarAttendeeEntity
-
-    func entities(for identifiers: [AgendaCalendarAttendeeEntity.ID]) async throws -> [AgendaCalendarAttendeeEntity] {
-        // Agenda a Blocchi does not persist attendees yet. The schema type is
-        // present because Calendar create/update intents require it.
-        []
     }
 }
 
